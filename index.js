@@ -79,7 +79,6 @@ wss.on("connection", async (vonageWS, request) => {
         session: {
           type: "realtime",
           instructions: instructions,
-          voice: process.env.VOICE_NAME || "alloy",
           modalities: ["text", "audio"],
           input_audio_format: "pcm16",
           output_audio_format: "pcm16",
