@@ -95,7 +95,7 @@ wss.on("connection", async (vonageWS, request) => {
     // Fetch knowledge base from main app
     let knowledge = "";
     try {
-      const knowledgeUrl = `${process.env.REPLIT_APP_URL || 'https://joggle-ai-production.replit.app'}/plugins/phone/knowledge/${businessId}`;
+      const knowledgeUrl = `${process.env.REPLIT_APP_URL || 'https://joggle-ai-production.replit.app'}/api/phone/knowledge/${businessId}`;
       console.log(`📚 Fetching knowledge from: ${knowledgeUrl}`);
       
       const response = await fetch(knowledgeUrl);
