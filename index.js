@@ -79,9 +79,13 @@ wss.on("connection", async (vonageWS, request) => {
         session: {
           type: "realtime",
           instructions: instructions,
-          modalities: ["text", "audio"],
-          input_audio_format: "pcm16",
-          output_audio_format: "pcm16",
+          audio: {
+            input: { format: "pcm16" },
+            output: { 
+              format: "pcm16",
+              voice: process.env.VOICE_NAME || "alloy"
+            }
+          },
           turn_detection: {
             type: "server_vad",
             threshold: Number(process.env.VAD_THRESHOLD || 0.5),
@@ -99,7 +103,8 @@ wss.on("connection", async (vonageWS, request) => {
     openaiWS.on("message", (raw) => {
       try {
         const evt = JSON.parse(raw.toString());
-        if (evt.type === "response.audio.delta" && evt.delta) {
+        // GA API uses response.output_audio.delta (not response.audio.delta)
+        if (evt.type === "response.output_audio.delta" && evt.delta) {
           // Forward OpenAI audio to Vonage
           sendVonageAudio(evt.delta);
         } else if (evt.type === "error") {
