@@ -80,12 +80,10 @@ wss.on("connection", async (vonageWS, request) => {
           type: "realtime",
           instructions: instructions,
           audio: {
-            input: { format: "pcm16" },
             output: { 
-              format: "pcm16",
               voice: process.env.VOICE_NAME || "alloy"
             }
-          },
+          }
         }
       });
       openaiReady = true;
