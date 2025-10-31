@@ -6,6 +6,31 @@ const WebSocket = require('ws');
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+// Resample PCM16 audio from 24kHz to 16kHz
+function resample24to16(buffer24k) {
+  // Convert buffer to Int16Array
+  const samples24k = new Int16Array(buffer24k.buffer, buffer24k.byteOffset, buffer24k.length / 2);
+  const ratio = 24000 / 16000; // 1.5
+  const outputLength = Math.floor(samples24k.length / ratio);
+  const samples16k = new Int16Array(outputLength);
+  
+  // Simple linear interpolation downsampling
+  for (let i = 0; i < outputLength; i++) {
+    const srcIndex = i * ratio;
+    const srcIndexFloor = Math.floor(srcIndex);
+    const srcIndexCeil = Math.min(srcIndexFloor + 1, samples24k.length - 1);
+    const fraction = srcIndex - srcIndexFloor;
+    
+    // Linear interpolation
+    samples16k[i] = Math.round(
+      samples24k[srcIndexFloor] * (1 - fraction) + 
+      samples24k[srcIndexCeil] * fraction
+    );
+  }
+  
+  return Buffer.from(samples16k.buffer);
+}
+
 const server = app.listen(PORT, () => {
   console.log(`✅ WebSocket server running on port ${PORT}`);
 });
@@ -56,9 +81,10 @@ wss.on("connection", async (vonageWS, request) => {
   
   const sendVonageAudio = (base64Audio) => {
     if (vonageWS.readyState === WebSocket.OPEN) {
-      // Vonage expects RAW PCM audio, not JSON-wrapped
-      const audioBuffer = Buffer.from(base64Audio, 'base64');
-      vonageWS.send(audioBuffer);
+      // OpenAI sends 24kHz PCM16, Vonage expects 16kHz PCM16
+      const audioBuffer24k = Buffer.from(base64Audio, 'base64');
+      const audioBuffer16k = resample24to16(audioBuffer24k);
+      vonageWS.send(audioBuffer16k);
     }
   };
 
