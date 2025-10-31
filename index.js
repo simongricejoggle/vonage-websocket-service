@@ -2,13 +2,14 @@ require('dotenv').config();
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const WebSocket = require('ws');
+
 const app = express();
 const PORT = process.env.PORT || 8080;
-// Create HTTP server
+
 const server = app.listen(PORT, () => {
   console.log(`✅ WebSocket server running on port ${PORT}`);
 });
-// Health check endpoint (Railway needs this)
+
 app.get('/', (req, res) => {
   res.json({ 
     status: 'running',
@@ -16,10 +17,11 @@ app.get('/', (req, res) => {
     timestamp: new Date().toISOString()
   });
 });
+
 app.get('/health', (req, res) => {
   res.json({ healthy: true });
 });
-// WebSocket server for Vonage
+
 const wss = new WebSocketServer({ 
   server,
   path: "/plugins/phone/stream",
@@ -27,7 +29,9 @@ const wss = new WebSocketServer({
   clientNoContextTakeover: true,
   serverNoContextTakeover: true
 });
+
 console.log("🎤 WebSocket server registered on /plugins/phone/stream");
+
 wss.on("connection", async (vonageWS, request) => {
   console.log("📞 New Vonage WebSocket connection");
   console.log("📞 Request URL:", request.url);
@@ -44,6 +48,7 @@ wss.on("connection", async (vonageWS, request) => {
   let openaiWS = null;
   let streamId = "";
   let sequence = 0;
+
   const sendOpenAI = (obj) => {
     if (openaiWS && openaiWS.readyState === WebSocket.OPEN) {
       openaiWS.send(JSON.stringify(obj));
@@ -61,6 +66,7 @@ wss.on("connection", async (vonageWS, request) => {
       }));
     }
   };
+
   const createOpenAIConnection = async () => {
     const model = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-10-01";
     const instructions = getBusinessInstructions(businessId);
@@ -70,6 +76,7 @@ wss.on("connection", async (vonageWS, request) => {
     openaiWS = new WebSocket(`wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`, {
       headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }
     });
+
     openaiWS.on("open", () => {
       console.log("🤖 OpenAI Realtime session connected");
       sendOpenAI({
@@ -90,6 +97,7 @@ wss.on("connection", async (vonageWS, request) => {
       });
       sendOpenAI({ type: "response.create" });
     });
+
     openaiWS.on("message", (raw) => {
       try {
         const evt = JSON.parse(raw.toString());
@@ -100,20 +108,34 @@ wss.on("connection", async (vonageWS, request) => {
         console.error("❌ OpenAI message error:", error);
       }
     });
+
     openaiWS.on("error", (error) => {
       console.error("❌ OpenAI WebSocket error:", error);
     });
+
     openaiWS.on("close", () => {
       console.log("🤖 OpenAI Realtime session closed");
     });
   };
+
   vonageWS.on("message", async (raw) => {
     try {
+      // Check if this is a Buffer or string
+      const isBuffer = Buffer.isBuffer(raw);
+      console.log(`📨 Received message: type=${isBuffer ? 'Buffer' : 'string'}, size=${raw.length} bytes`);
+      
+      // Try to parse as JSON
       const rawString = raw.toString();
+      
+      // Quick check - if it doesn't start with { or [, it's not JSON
       if (rawString[0] !== '{' && rawString[0] !== '[') {
+        console.log(`⚠️ Skipping non-JSON message (starts with: ${rawString.substring(0, 10)})`);
         return;
       }
+      
       const msg = JSON.parse(rawString);
+      console.log(`📋 Vonage event: ${msg.event}`, msg);
+      
       if (msg.event === "connected") {
         console.log("📞 Vonage connected, version:", msg.version);
       } else if (msg.event === "start") {
@@ -135,14 +157,17 @@ wss.on("connection", async (vonageWS, request) => {
       }
     }
   });
+
   vonageWS.on("error", (error) => {
     console.error("❌ Vonage WebSocket error:", error);
   });
+
   vonageWS.on("close", () => {
     console.log("📞 Vonage connection closed");
     if (openaiWS) openaiWS.close();
   });
 });
+
 function getBusinessInstructions(bizId) {
   const profiles = {
     wethreeloggerheads: "You are Joggle for We Three Loggerheads pub. Tone: warm, friendly, and welcoming. You can answer about opening hours, food menu, drinks, events, bookings, and general pub information. If caller wants to book a table, collect name, phone, date, time, and number of guests. Always be helpful and represent the pub's friendly atmosphere.",
@@ -151,4 +176,5 @@ function getBusinessInstructions(bizId) {
   };
   return profiles[bizId] || profiles.default;
 }
+
 console.log(`🚀 Service started successfully on port ${PORT}`);
