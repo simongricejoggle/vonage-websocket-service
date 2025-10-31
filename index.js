@@ -86,12 +86,6 @@ wss.on("connection", async (vonageWS, request) => {
               voice: process.env.VOICE_NAME || "alloy"
             }
           },
-          turn_detection: {
-            type: "server_vad",
-            threshold: Number(process.env.VAD_THRESHOLD || 0.5),
-            prefix_padding_ms: Number(process.env.VAD_PREFIX_MS || 200),
-            silence_duration_ms: Number(process.env.VAD_SILENCE_MS || 300)
-          }
         }
       });
       openaiReady = true;
