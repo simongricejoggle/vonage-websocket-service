@@ -90,7 +90,32 @@ wss.on("connection", async (vonageWS, request) => {
 
   const createOpenAIConnection = async () => {
     const model = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-10-01";
-    const instructions = getBusinessInstructions(businessId);
+    const baseInstructions = getBusinessInstructions(businessId);
+    
+    // Fetch knowledge base from main app
+    let knowledge = "";
+    try {
+      const knowledgeUrl = `${process.env.REPLIT_APP_URL || 'https://joggle-ai-production.replit.app'}/plugins/phone/knowledge/${businessId}`;
+      console.log(`📚 Fetching knowledge from: ${knowledgeUrl}`);
+      
+      const response = await fetch(knowledgeUrl);
+      if (response.ok) {
+        const data = await response.json();
+        if (data.success && data.knowledge) {
+          knowledge = data.knowledge;
+          console.log(`✅ Retrieved ${knowledge.length} chars of knowledge`);
+        }
+      } else {
+        console.log(`⚠️ Knowledge fetch failed: ${response.status}`);
+      }
+    } catch (error) {
+      console.log(`⚠️ Could not fetch knowledge:`, error.message);
+    }
+    
+    // Combine instructions with knowledge
+    const instructions = knowledge 
+      ? `${baseInstructions}\n\nKNOWLEDGE BASE:\n${knowledge}`
+      : baseInstructions;
     
     console.log(`🤖 Creating OpenAI connection for business: ${businessId}`);
     
@@ -109,6 +134,12 @@ wss.on("connection", async (vonageWS, request) => {
             output: { 
               voice: process.env.VOICE_NAME || "alloy"
             }
+          },
+          turn_detection: {
+            type: "server_vad",
+            threshold: 0.5,
+            prefix_padding_ms: 300,
+            silence_duration_ms: 500
           }
         }
       });
