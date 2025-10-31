@@ -46,8 +46,7 @@ wss.on("connection", async (vonageWS, request) => {
   console.log(`📞 From: ${fromNumber}, To: ${toNumber}`);
   
   let openaiWS = null;
-  let streamId = "";
-  let sequence = 0;
+  let openaiReady = false;
 
   const sendOpenAI = (obj) => {
     if (openaiWS && openaiWS.readyState === WebSocket.OPEN) {
@@ -56,14 +55,10 @@ wss.on("connection", async (vonageWS, request) => {
   };
   
   const sendVonageAudio = (base64Audio) => {
-    if (vonageWS.readyState === WebSocket.OPEN && streamId) {
-      sequence++;
-      vonageWS.send(JSON.stringify({
-        event: "media",
-        stream_id: streamId,
-        media: { payload: base64Audio },
-        sequence
-      }));
+    if (vonageWS.readyState === WebSocket.OPEN) {
+      // Vonage expects RAW PCM audio, not JSON-wrapped
+      const audioBuffer = Buffer.from(base64Audio, 'base64');
+      vonageWS.send(audioBuffer);
     }
   };
 
@@ -95,6 +90,9 @@ wss.on("connection", async (vonageWS, request) => {
           }
         }
       });
+      openaiReady = true;
+      console.log("✅ OpenAI session configured, ready for audio");
+      // Greet the caller
       sendOpenAI({ type: "response.create" });
     });
 
@@ -102,7 +100,10 @@ wss.on("connection", async (vonageWS, request) => {
       try {
         const evt = JSON.parse(raw.toString());
         if (evt.type === "response.audio.delta" && evt.delta) {
+          // Forward OpenAI audio to Vonage
           sendVonageAudio(evt.delta);
+        } else if (evt.type === "error") {
+          console.error("❌ OpenAI error:", evt.error);
         }
       } catch (error) {
         console.error("❌ OpenAI message error:", error);
@@ -115,44 +116,42 @@ wss.on("connection", async (vonageWS, request) => {
 
     openaiWS.on("close", () => {
       console.log("🤖 OpenAI Realtime session closed");
+      openaiReady = false;
     });
   };
 
   vonageWS.on("message", async (raw) => {
     try {
-      // Check if this is a Buffer or string
+      // Vonage sends BOTH JSON control messages AND raw binary audio
       const isBuffer = Buffer.isBuffer(raw);
-      console.log(`📨 Received message: type=${isBuffer ? 'Buffer' : 'string'}, size=${raw.length} bytes`);
       
-      // Try to parse as JSON
+      // Try to parse as JSON first
       const rawString = raw.toString();
       
-      // Quick check - if it doesn't start with { or [, it's not JSON
-      if (rawString[0] !== '{' && rawString[0] !== '[') {
-        console.log(`⚠️ Skipping non-JSON message (starts with: ${rawString.substring(0, 10)})`);
-        return;
-      }
-      
-      const msg = JSON.parse(rawString);
-      console.log(`📋 Vonage event: ${msg.event}`, msg);
-      
-      if (msg.event === "connected") {
-        console.log("📞 Vonage connected, version:", msg.version);
-      } else if (msg.event === "start") {
-        streamId = msg.stream_id;
-        console.log("🎬 Call started, stream_id:", streamId);
-        await createOpenAIConnection();
-      } else if (msg.event === "media" && msg.media?.payload) {
-        sendOpenAI({
-          type: "input_audio_buffer.append",
-          audio: msg.media.payload
-        });
-      } else if (msg.event === "stop") {
-        console.log("🛑 Call ended");
-        if (openaiWS) openaiWS.close();
+      // If it starts with {, it's a JSON control message
+      if (rawString[0] === '{') {
+        const msg = JSON.parse(rawString);
+        console.log(`📋 Vonage event: ${msg.event}`);
+        
+        if (msg.event === "websocket:connected") {
+          console.log("📞 Vonage connected, content-type:", msg['content-type']);
+          // Start OpenAI connection immediately
+          await createOpenAIConnection();
+        }
+      } else {
+        // This is binary audio data (640 bytes of L16 PCM)
+        if (openaiReady && isBuffer && raw.length === 640) {
+          // Convert raw PCM buffer to base64 for OpenAI
+          const base64Audio = raw.toString('base64');
+          sendOpenAI({
+            type: "input_audio_buffer.append",
+            audio: base64Audio
+          });
+        }
       }
     } catch (error) {
-      if (error.message && !error.message.includes('Unexpected token')) {
+      // Only log actual errors, not parsing issues
+      if (!error.message?.includes('Unexpected token')) {
         console.error("❌ Vonage message error:", error);
       }
     }
