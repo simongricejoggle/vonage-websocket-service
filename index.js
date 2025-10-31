@@ -77,6 +77,7 @@ wss.on("connection", async (vonageWS, request) => {
       sendOpenAI({
         type: "session.update",
         session: {
+	  type: "session",
           instructions: instructions,
           voice: process.env.VOICE_NAME || "alloy",
           modalities: ["text", "audio"],
