@@ -127,11 +127,23 @@ wss.on("connection", async (vonageWS, request) => {
     });
   };
 
-  // Handle Vonage messages
+      // Handle Vonage messages
   vonageWS.on("message", async (raw) => {
     try {
-      const msg = JSON.parse(raw.toString());
+      // Vonage sends text messages (JSON) for control, might send binary for audio
+      // First, check if it's actually parseable JSON
+      const rawString = raw.toString();
       
+      // Skip if it looks like binary data (starts with non-JSON characters)
+      if (rawString[0] !== '{' && rawString[0] !== '[') {
+        // This is likely binary audio data, not a JSON message
+        // Vonage should send audio in JSON format, so this shouldn't happen
+        // But if it does, just skip it
+        return;
+      }
+      
+      const msg = JSON.parse(rawString);
+ 
       if (msg.event === "connected") {
         console.log("📞 Vonage connected, version:", msg.version);
       } else if (msg.event === "start") {
@@ -149,9 +161,11 @@ wss.on("connection", async (vonageWS, request) => {
         if (openaiWS) openaiWS.close();
       }
     } catch (error) {
-      console.error("❌ Vonage message error:", error);
+      // Only log actual errors, not parsing issues from non-JSON data
+      if (error.message && !error.message.includes('Unexpected token')) {
+        console.error("❌ Vonage message error:", error);
+      }
     }
-  });
 
   vonageWS.on("error", (error) => {
     console.error("❌ Vonage WebSocket error:", error);
