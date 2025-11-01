@@ -1,4 +1,4 @@
-require('dotenv').config();
+wherequire('dotenv').config();
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const WebSocket = require('ws');
@@ -101,6 +101,7 @@ wss.on("connection", async (vonageWS, request) => {
     let voiceConfig = { voice: "alloy", speed: 1.0 };
     let voiceInstructions = "";
     let languagePrompt = "";
+    let welcomeGreeting = "Hi, this is Joggle answering for your business.";
     
     try {
       const knowledgeUrl = `${process.env.REPLIT_APP_URL || 'https://joggle-ai-production.replit.app'}/api/phone/knowledge/${businessId}`;
@@ -114,8 +115,10 @@ wss.on("connection", async (vonageWS, request) => {
           voiceConfig = data.voiceConfig || { voice: "alloy", speed: 1.0 };
           voiceInstructions = data.voiceInstructions || "";
           languagePrompt = data.languagePrompt || "";
+          welcomeGreeting = voiceConfig.welcomeGreeting || welcomeGreeting;
           console.log(`✅ Retrieved ${knowledge.length} chars of knowledge`);
           console.log(`🎙️ Voice config:`, voiceConfig);
+          console.log(`👋 Welcome greeting: ${welcomeGreeting}`);
           if (languagePrompt) {
             console.log(`🌍 Language prompt: ${languagePrompt.substring(0, 100)}...`);
           }
@@ -197,7 +200,24 @@ wss.on("connection", async (vonageWS, request) => {
       openaiReady = true;
       console.log("✅ OpenAI session configured, ready for audio");
       console.log("📝 Full instructions length:", instructions.length);
-      // Greet the caller
+      
+      // Add welcome greeting as user message, then ask AI to respond
+      console.log(`👋 Sending welcome prompt: "${welcomeGreeting}"`);
+      sendOpenAI({
+        type: "conversation.item.create",
+        item: {
+          type: "message",
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: `[SYSTEM: This is the start of the call. Greet the caller by saying exactly: "${welcomeGreeting}" and then wait for them to respond.]`
+            }
+          ]
+        }
+      });
+      
+      // Trigger the greeting response
       sendOpenAI({ type: "response.create" });
     });
 
