@@ -89,7 +89,7 @@ wss.on("connection", async (vonageWS, request) => {
   };
 
   const createOpenAIConnection = async () => {
-    const model = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-10-01";
+    const model = "gpt-realtime";
     const baseInstructions = getBusinessInstructions(businessId);
     
     // Fetch knowledge base from main app
@@ -130,6 +130,7 @@ wss.on("connection", async (vonageWS, request) => {
         session: {
           type: "realtime",
           model: "gpt-realtime",
+          modalities: ["text", "audio"],
           instructions: instructions,
           audio: {
             input: { format: "pcm16" },
@@ -142,7 +143,10 @@ wss.on("connection", async (vonageWS, request) => {
             type: "server_vad",
             threshold: 0.5,
             prefix_padding_ms: 300,
-            silence_duration_ms: 500
+            silence_duration_ms: 200
+          },
+          input_audio_transcription: {
+            model: "whisper-1"
           }
         }
       });
