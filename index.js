@@ -72,6 +72,10 @@ wss.on("connection", async (vonageWS, request) => {
   
   let openaiWS = null;
   let openaiReady = false;
+  // Interruption handling state
+  let activeResponseId = null;
+  let isAiSpeaking = false;
+  let audioQueue = [];  // Buffer for queued audio packets
 
   const sendOpenAI = (obj) => {
     if (openaiWS && openaiWS.readyState === WebSocket.OPEN) {
@@ -170,9 +174,10 @@ wss.on("connection", async (vonageWS, request) => {
             input: {
               turn_detection: {
                 type: "server_vad",
-                threshold: 0.5,
-                prefix_padding_ms: 300,
-                silence_duration_ms: 200
+                threshold: 0.35,  // More sensitive for faster detection (aligned with webapp)
+                prefix_padding_ms: 120,  // Faster start
+                silence_duration_ms: 160,  // Faster turn-taking
+                create_response: false  // Manual control for better interruption handling
               }
             },
             output: { 
@@ -217,20 +222,65 @@ wss.on("connection", async (vonageWS, request) => {
           console.log(`🔔 OpenAI event: ${evt.type}`);
         }
         
-        // GA API uses response.output_audio.delta (not response.audio.delta)
-        if (evt.type === "response.output_audio.delta" && evt.delta) {
-          // Forward OpenAI audio to Vonage
-          sendVonageAudio(evt.delta);
-        } else if (evt.type === "error") {
-          console.error("❌ OpenAI error:", JSON.stringify(evt.error, null, 2));
-        } else if (evt.type === "session.updated") {
-          console.log("✅ Session updated successfully");
-        } else if (evt.type === "response.done") {
-          console.log("✅ Response completed");
+        // Track response lifecycle for interruption handling
+        if (evt.type === "response.created") {
+          activeResponseId = evt.response?.id || null;
+          console.log(`🎯 Response created: ${activeResponseId}`);
+        } else if (evt.type === "response.output_item.added" || 
+                   (evt.type === "response.output_audio.delta" && !isAiSpeaking)) {
+          // AI has started speaking
+          isAiSpeaking = true;
+          console.log("🔊 AI started speaking");
         } else if (evt.type === "input_audio_buffer.speech_started") {
-          console.log("🎤 User started speaking");
+          // User started speaking
+          if (isAiSpeaking && activeResponseId) {
+            // INTERRUPTION DETECTED - Cancel AI response immediately
+            console.log(`⚠️ Interruption detected - canceling response ${activeResponseId}`);
+            
+            // Send cancel message to OpenAI with response ID
+            sendOpenAI({ 
+              type: "response.cancel",
+              response_id: activeResponseId
+            });
+            
+            // Clear audio queue to prevent further playback
+            audioQueue = [];
+            
+            // Clear AI speaking state
+            isAiSpeaking = false;
+            activeResponseId = null;
+            
+            console.log("✅ AI response canceled, ready for user input");
+          } else {
+            console.log("🎤 User started speaking");
+          }
         } else if (evt.type === "input_audio_buffer.speech_stopped") {
           console.log("🎤 User stopped speaking");
+          // After user finishes speaking, create a new response
+          sendOpenAI({ type: "response.create" });
+        } else if (evt.type === "response.done") {
+          // AI finished responding
+          isAiSpeaking = false;
+          activeResponseId = null;
+          console.log("✅ Response completed");
+        }
+        
+        // GA API uses response.output_audio.delta (not response.audio.delta)
+        if (evt.type === "response.output_audio.delta" && evt.delta) {
+          // Only forward audio if AI is still speaking (not interrupted)
+          if (isAiSpeaking) {
+            sendVonageAudio(evt.delta);
+          }
+        } else if (evt.type === "error") {
+          // Ignore expected cancellation errors
+          if (evt.error.message?.includes('no active response') || 
+              evt.error.message?.includes('cancelled')) {
+            console.log("ℹ️ Response cancellation confirmed");
+          } else {
+            console.error("❌ OpenAI error:", JSON.stringify(evt.error, null, 2));
+          }
+        } else if (evt.type === "session.updated") {
+          console.log("✅ Session updated successfully");
         }
       } catch (error) {
         console.error("❌ OpenAI message error:", error);
