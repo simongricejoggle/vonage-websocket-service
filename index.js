@@ -130,9 +130,10 @@ wss.on("connection", async (vonageWS, request) => {
         session: {
           type: "realtime",
           model: "gpt-realtime",
-          instructions: instructions,
+          instructions: instructions + "\n\nIMPORTANT: Always respond in English only.",
           audio: {
             input: {
+              format: "pcm16",
               turn_detection: {
                 type: "server_vad",
                 threshold: 0.5,
@@ -141,13 +142,15 @@ wss.on("connection", async (vonageWS, request) => {
               }
             },
             output: { 
-              voice: process.env.VOICE_NAME || "alloy"
+              voice: process.env.VOICE_NAME || "alloy",
+              format: "pcm16"
             }
           }
         }
       });
       openaiReady = true;
       console.log("✅ OpenAI session configured, ready for audio");
+      console.log("📝 Instructions:", instructions);
       // Greet the caller
       sendOpenAI({ type: "response.create" });
     });
@@ -155,12 +158,26 @@ wss.on("connection", async (vonageWS, request) => {
     openaiWS.on("message", (raw) => {
       try {
         const evt = JSON.parse(raw.toString());
+        
+        // Log important events for debugging
+        if (evt.type && !evt.type.includes('.delta')) {
+          console.log(`🔔 OpenAI event: ${evt.type}`);
+        }
+        
         // GA API uses response.output_audio.delta (not response.audio.delta)
         if (evt.type === "response.output_audio.delta" && evt.delta) {
           // Forward OpenAI audio to Vonage
           sendVonageAudio(evt.delta);
         } else if (evt.type === "error") {
-          console.error("❌ OpenAI error:", evt.error);
+          console.error("❌ OpenAI error:", JSON.stringify(evt.error, null, 2));
+        } else if (evt.type === "session.updated") {
+          console.log("✅ Session updated successfully");
+        } else if (evt.type === "response.done") {
+          console.log("✅ Response completed");
+        } else if (evt.type === "input_audio_buffer.speech_started") {
+          console.log("🎤 User started speaking");
+        } else if (evt.type === "input_audio_buffer.speech_stopped") {
+          console.log("🎤 User stopped speaking");
         }
       } catch (error) {
         console.error("❌ OpenAI message error:", error);
@@ -204,6 +221,8 @@ wss.on("connection", async (vonageWS, request) => {
             type: "input_audio_buffer.append",
             audio: base64Audio
           });
+        } else if (isBuffer && raw.length !== 640) {
+          console.log(`⚠️ Unexpected audio buffer size: ${raw.length} bytes (expected 640)`);
         }
       }
     } catch (error) {
