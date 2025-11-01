@@ -133,7 +133,6 @@ wss.on("connection", async (vonageWS, request) => {
           instructions: instructions + "\n\nIMPORTANT: Always respond in English only.",
           audio: {
             input: {
-              format: "pcm16",
               turn_detection: {
                 type: "server_vad",
                 threshold: 0.5,
@@ -142,8 +141,7 @@ wss.on("connection", async (vonageWS, request) => {
               }
             },
             output: { 
-              voice: process.env.VOICE_NAME || "alloy",
-              format: "pcm16"
+              voice: process.env.VOICE_NAME || "alloy"
             }
           }
         }
