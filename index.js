@@ -149,8 +149,8 @@ wss.on("connection", async (vonageWS, request) => {
       instructions += voiceInstructions;
     }
     
-    // Only enforce English if language is explicitly set to English
-    if (voiceConfig.language && (voiceConfig.language === 'en-GB' || voiceConfig.language === 'en-US')) {
+    // Enforce English by default unless a non-English language is explicitly set
+    if (!voiceConfig.language || voiceConfig.language === 'en-GB' || voiceConfig.language === 'en-US') {
       instructions += "\n\nIMPORTANT: Always respond in English only.";
     }
     
