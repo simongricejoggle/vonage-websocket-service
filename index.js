@@ -180,9 +180,9 @@ wss.on("connection", async (vonageWS, request) => {
             input: {
               turn_detection: {
                 type: "server_vad",
-                threshold: 0.5,  // Higher sensitivity - detect speech faster (0.0-1.0, higher = more sensitive)
-                prefix_padding_ms: 50,   // Minimal padding for instant detection
-                silence_duration_ms: 500,  // Longer silence to avoid cutting off mid-sentence
+                threshold: 0.5,  // Balanced sensitivity for natural conversation (0.0-1.0, higher = more sensitive)
+                prefix_padding_ms: 200,   // Natural padding to capture full speech start
+                silence_duration_ms: 800,  // Allow natural pauses without AI jumping in too quickly
                 create_response: false  // Manual control for better interruption handling
               }
             },
