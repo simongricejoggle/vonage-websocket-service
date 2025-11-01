@@ -130,7 +130,6 @@ wss.on("connection", async (vonageWS, request) => {
         session: {
           type: "realtime",
           model: "gpt-realtime",
-          modalities: ["text", "audio"],
           instructions: instructions,
           audio: {
             input: { format: "pcm16" },
@@ -144,9 +143,6 @@ wss.on("connection", async (vonageWS, request) => {
             threshold: 0.5,
             prefix_padding_ms: 300,
             silence_duration_ms: 200
-          },
-          input_audio_transcription: {
-            model: "whisper-1"
           }
         }
       });
