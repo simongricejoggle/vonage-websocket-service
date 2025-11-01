@@ -76,6 +76,8 @@ wss.on("connection", async (vonageWS, request) => {
   let activeResponseId = null;
   let isAiSpeaking = false;
   let audioQueue = [];  // Buffer for queued audio packets
+  let pendingResponseCreate = false;  // Flag to defer response.create until cancel confirmed
+  let cancelTimeout = null;  // Timeout to prevent deadlock
 
   const sendOpenAI = (obj) => {
     if (openaiWS && openaiWS.readyState === WebSocket.OPEN) {
@@ -233,6 +235,7 @@ wss.on("connection", async (vonageWS, request) => {
         // Track response lifecycle for interruption handling
         if (evt.type === "response.created") {
           activeResponseId = evt.response?.id || null;
+          pendingResponseCreate = false;  // Clear pending flag
           console.log(`🎯 Response created: ${activeResponseId}`);
         } else if (evt.type === "response.output_item.added" || 
                    (evt.type === "response.output_audio.delta" && !isAiSpeaking)) {
@@ -256,21 +259,52 @@ wss.on("connection", async (vonageWS, request) => {
             
             // Clear AI speaking state
             isAiSpeaking = false;
-            activeResponseId = null;
             
-            console.log("✅ AI response canceled, ready for user input");
+            console.log("⏳ Waiting for cancellation confirmation before next response");
           } else {
             console.log("🎤 User started speaking");
           }
         } else if (evt.type === "input_audio_buffer.speech_stopped") {
           console.log("🎤 User stopped speaking");
-          // After user finishes speaking, create a new response
-          sendOpenAI({ type: "response.create" });
-        } else if (evt.type === "response.done") {
-          // AI finished responding
+          
+          // Only create response if no active response exists
+          if (!activeResponseId) {
+            sendOpenAI({ type: "response.create" });
+          } else {
+            // Defer response.create until cancellation is confirmed
+            pendingResponseCreate = true;
+            console.log("⏳ Deferring response.create until cancellation confirmed");
+            
+            // Fallback timeout to prevent deadlock (500ms)
+            if (cancelTimeout) clearTimeout(cancelTimeout);
+            cancelTimeout = setTimeout(() => {
+              if (pendingResponseCreate) {
+                console.log("⏰ Cancel timeout - forcing response.create");
+                pendingResponseCreate = false;
+                activeResponseId = null;
+                sendOpenAI({ type: "response.create" });
+              }
+            }, 500);
+          }
+        } else if (evt.type === "response.done" || evt.type === "response.cancelled") {
+          // AI finished or was cancelled
           isAiSpeaking = false;
+          const wasCancelled = evt.type === "response.cancelled";
+          console.log(wasCancelled ? "🚫 Response cancelled" : "✅ Response completed");
+          
+          // Clear active response
           activeResponseId = null;
-          console.log("✅ Response completed");
+          
+          // If we have a pending response.create, trigger it now
+          if (pendingResponseCreate) {
+            pendingResponseCreate = false;
+            if (cancelTimeout) {
+              clearTimeout(cancelTimeout);
+              cancelTimeout = null;
+            }
+            console.log("✅ Cancellation confirmed - creating new response");
+            sendOpenAI({ type: "response.create" });
+          }
         }
         
         // GA API uses response.output_audio.delta (not response.audio.delta)
