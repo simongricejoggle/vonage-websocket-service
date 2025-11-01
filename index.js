@@ -92,8 +92,12 @@ wss.on("connection", async (vonageWS, request) => {
     const model = "gpt-realtime";
     const baseInstructions = getBusinessInstructions(businessId);
     
-    // Fetch knowledge base from main app
+    // Fetch knowledge base and voice settings from main app
     let knowledge = "";
+    let voiceConfig = { voice: "alloy", speed: 1.0 };
+    let voiceInstructions = "";
+    let languagePrompt = "";
+    
     try {
       const knowledgeUrl = `${process.env.REPLIT_APP_URL || 'https://joggle-ai-production.replit.app'}/api/phone/knowledge/${businessId}`;
       console.log(`📚 Fetching knowledge from: ${knowledgeUrl}`);
@@ -101,9 +105,16 @@ wss.on("connection", async (vonageWS, request) => {
       const response = await fetch(knowledgeUrl);
       if (response.ok) {
         const data = await response.json();
-        if (data.success && data.knowledge) {
-          knowledge = data.knowledge;
+        if (data.success) {
+          knowledge = data.knowledge || "";
+          voiceConfig = data.voiceConfig || { voice: "alloy", speed: 1.0 };
+          voiceInstructions = data.voiceInstructions || "";
+          languagePrompt = data.languagePrompt || "";
           console.log(`✅ Retrieved ${knowledge.length} chars of knowledge`);
+          console.log(`🎙️ Voice config:`, voiceConfig);
+          if (languagePrompt) {
+            console.log(`🌍 Language prompt: ${languagePrompt.substring(0, 100)}...`);
+          }
         }
       } else {
         console.log(`⚠️ Knowledge fetch failed: ${response.status}`);
@@ -112,10 +123,32 @@ wss.on("connection", async (vonageWS, request) => {
       console.log(`⚠️ Could not fetch knowledge:`, error.message);
     }
     
-    // Combine instructions with knowledge
-    const instructions = knowledge 
-      ? `${baseInstructions}\n\nKNOWLEDGE BASE:\n${knowledge}`
-      : baseInstructions;
+    // Combine instructions - LANGUAGE FIRST (if non-English), then base, then knowledge, then voice style
+    let instructions = "";
+    
+    // Add language prompt first if non-English (same as webapp)
+    if (languagePrompt) {
+      instructions = `${languagePrompt}\n\n==========\n\n`;
+      console.log(`🌍 Voice session using non-English language`);
+    }
+    
+    // Then base instructions
+    instructions += baseInstructions;
+    
+    // Then knowledge base
+    if (knowledge) {
+      instructions += `\n\nKNOWLEDGE BASE:\n${knowledge}`;
+    }
+    
+    // Then voice style instructions
+    if (voiceInstructions) {
+      instructions += voiceInstructions;
+    }
+    
+    // Only enforce English if language is explicitly set to English
+    if (voiceConfig.language && (voiceConfig.language === 'en-GB' || voiceConfig.language === 'en-US')) {
+      instructions += "\n\nIMPORTANT: Always respond in English only.";
+    }
     
     console.log(`🤖 Creating OpenAI connection for business: ${businessId}`);
     
@@ -125,12 +158,14 @@ wss.on("connection", async (vonageWS, request) => {
 
     openaiWS.on("open", () => {
       console.log("🤖 OpenAI Realtime session connected");
-      sendOpenAI({
+      
+      // Build session configuration with voice settings
+      const sessionConfig = {
         type: "session.update",
         session: {
           type: "realtime",
           model: "gpt-realtime",
-          instructions: instructions + "\n\nIMPORTANT: Always respond in English only.",
+          instructions: instructions,
           audio: {
             input: {
               turn_detection: {
@@ -141,14 +176,34 @@ wss.on("connection", async (vonageWS, request) => {
               }
             },
             output: { 
-              voice: process.env.VOICE_NAME || "alloy"
+              voice: voiceConfig.voice
             }
           }
         }
-      });
+      };
+      
+      // Add speed if configured (and not default)
+      if (voiceConfig.speed && voiceConfig.speed !== 1.0) {
+        sessionConfig.session.speed = voiceConfig.speed;
+        console.log(`⚡ Voice speed set to: ${voiceConfig.speed}x`);
+      }
+      
+      // Add OpenAI native emotion/tone if set
+      if (voiceConfig.realtimeEmotion) {
+        sessionConfig.session.emotion = voiceConfig.realtimeEmotion;
+        console.log(`🎭 Using native OpenAI emotion: ${voiceConfig.realtimeEmotion}`);
+      }
+      
+      // Add OpenAI native accent if set
+      if (voiceConfig.realtimeAccent) {
+        sessionConfig.session.accent = voiceConfig.realtimeAccent;
+        console.log(`🗣️ Using native OpenAI accent: ${voiceConfig.realtimeAccent}`);
+      }
+      
+      sendOpenAI(sessionConfig);
       openaiReady = true;
       console.log("✅ OpenAI session configured, ready for audio");
-      console.log("📝 Instructions:", instructions);
+      console.log("📝 Full instructions length:", instructions.length);
       // Greet the caller
       sendOpenAI({ type: "response.create" });
     });
