@@ -104,7 +104,7 @@ wss.on("connection", async (vonageWS, request) => {
     let welcomeGreeting = "Hi, this is Joggle answering for your business.";
     
     try {
-      const knowledgeUrl = `${process.env.REPLIT_APP_URL || 'https://joggle-ai-production.replit.app'}/api/phone/knowledge/${businessId}`;
+      const knowledgeUrl = `${process.env.REPLIT_APP_URL || 'https://myjoggle.replit.app'}/api/phone/knowledge/${businessId}`;
       console.log(`📚 Fetching knowledge from: ${knowledgeUrl}`);
       
       const response = await fetch(knowledgeUrl);
@@ -177,9 +177,9 @@ wss.on("connection", async (vonageWS, request) => {
             input: {
               turn_detection: {
                 type: "server_vad",
-                threshold: 0.35,  // More sensitive for faster detection (aligned with webapp)
-                prefix_padding_ms: 120,  // Faster start
-                silence_duration_ms: 160,  // Faster turn-taking
+                threshold: 0.3,  // Very sensitive - detect speech quickly
+                prefix_padding_ms: 100,  // Minimal padding for fast detection
+                silence_duration_ms: 200,  // Short silence before considering turn complete
                 create_response: false  // Manual control for better interruption handling
               }
             },
