@@ -193,18 +193,6 @@ wss.on("connection", async (vonageWS, request) => {
         console.log(`⚡ Voice speed set to: ${voiceConfig.speed}x`);
       }
       
-      // Add OpenAI native emotion/tone if set
-      if (voiceConfig.realtimeEmotion) {
-        sessionConfig.session.emotion = voiceConfig.realtimeEmotion;
-        console.log(`🎭 Using native OpenAI emotion: ${voiceConfig.realtimeEmotion}`);
-      }
-      
-      // Add OpenAI native accent if set
-      if (voiceConfig.realtimeAccent) {
-        sessionConfig.session.accent = voiceConfig.realtimeAccent;
-        console.log(`🗣️ Using native OpenAI accent: ${voiceConfig.realtimeAccent}`);
-      }
-      
       sendOpenAI(sessionConfig);
       openaiReady = true;
       console.log("✅ OpenAI session configured, ready for audio");
