@@ -74,6 +74,7 @@ wss.on("connection", async (vonageWS, request) => {
   let openaiReady = false;
   // Interruption handling state
   let activeResponseId = null;
+  let activeItemId = null;  // Track current output item for truncation
   let isAiSpeaking = false;
   let audioQueue = [];  // Buffer for queued audio packets
   let pendingResponseCreate = false;  // Flag to defer response.create until cancel confirmed
@@ -179,9 +180,9 @@ wss.on("connection", async (vonageWS, request) => {
             input: {
               turn_detection: {
                 type: "server_vad",
-                threshold: 0.3,  // Very sensitive - detect speech quickly
-                prefix_padding_ms: 100,  // Minimal padding for fast detection
-                silence_duration_ms: 200,  // Short silence before considering turn complete
+                threshold: 0.5,  // Higher sensitivity - detect speech faster (0.0-1.0, higher = more sensitive)
+                prefix_padding_ms: 50,   // Minimal padding for instant detection
+                silence_duration_ms: 500,  // Longer silence to avoid cutting off mid-sentence
                 create_response: false  // Manual control for better interruption handling
               }
             },
@@ -237,30 +238,46 @@ wss.on("connection", async (vonageWS, request) => {
           activeResponseId = evt.response?.id || null;
           pendingResponseCreate = false;  // Clear pending flag
           console.log(`🎯 Response created: ${activeResponseId}`);
-        } else if (evt.type === "response.output_item.added" || 
-                   (evt.type === "response.output_audio.delta" && !isAiSpeaking)) {
-          // AI has started speaking
+        } else if (evt.type === "response.output_item.added") {
+          // Track output item ID for potential truncation
+          activeItemId = evt.item?.id || null;
           isAiSpeaking = true;
-          console.log("🔊 AI started speaking");
+          console.log(`🔊 AI started speaking - item: ${activeItemId}`);
+        } else if (evt.type === "response.output_audio.delta" && !isAiSpeaking) {
+          // Fallback if we missed output_item.added
+          isAiSpeaking = true;
+          console.log("🔊 AI started speaking (via audio delta)");
         } else if (evt.type === "input_audio_buffer.speech_started") {
           // User started speaking
           if (isAiSpeaking && activeResponseId) {
             // INTERRUPTION DETECTED - Cancel AI response immediately
-            console.log(`⚠️ Interruption detected - canceling response ${activeResponseId}`);
+            console.log(`⚠️ INTERRUPTION: User speaking, canceling AI response ${activeResponseId}`);
             
-            // Send cancel message to OpenAI with response ID
+            // 1. Cancel the active response immediately
             sendOpenAI({ 
               type: "response.cancel",
               response_id: activeResponseId
             });
             
-            // Clear audio queue to prevent further playback
+            // 2. Truncate the conversation to remove incomplete AI message
+            // This ensures the partial response doesn't appear in conversation history
+            if (activeItemId) {
+              sendOpenAI({
+                type: "conversation.item.truncate",
+                item_id: activeItemId,
+                content_index: 0,
+                audio_end_ms: 0
+              });
+              console.log(`✂️ Truncated conversation item: ${activeItemId}`);
+            }
+            
+            // 3. Clear audio queue to stop all pending audio immediately
             audioQueue = [];
             
-            // Clear AI speaking state
+            // 4. Clear AI speaking state
             isAiSpeaking = false;
             
-            console.log("⏳ Waiting for cancellation confirmation before next response");
+            console.log("⏸️ AI interrupted - ready for user input");
           } else {
             console.log("🎤 User started speaking");
           }
@@ -292,8 +309,9 @@ wss.on("connection", async (vonageWS, request) => {
           const wasCancelled = evt.type === "response.cancelled";
           console.log(wasCancelled ? "🚫 Response cancelled" : "✅ Response completed");
           
-          // Clear active response
+          // Clear active response and item
           activeResponseId = null;
+          activeItemId = null;
           
           // If we have a pending response.create, trigger it now
           if (pendingResponseCreate) {
