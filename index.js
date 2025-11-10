@@ -47,6 +47,58 @@ app.get('/health', (req, res) => {
   res.json({ healthy: true });
 });
 
+app.get('/test-openai', async (req, res) => {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    return res.status(500).json({ 
+      success: false, 
+      error: 'OPENAI_API_KEY not configured' 
+    });
+  }
+
+  try {
+    const WebSocket = require('ws');
+    const testWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01', {
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'OpenAI-Beta': 'realtime=v1'
+      }
+    });
+
+    const timeout = setTimeout(() => {
+      testWs.close();
+      res.status(500).json({ 
+        success: false, 
+        error: 'Connection timeout' 
+      });
+    }, 10000);
+
+    testWs.on('open', () => {
+      clearTimeout(timeout);
+      testWs.close();
+      res.json({ 
+        success: true, 
+        message: 'Successfully connected to OpenAI Realtime API',
+        apiKeyConfigured: true
+      });
+    });
+
+    testWs.on('error', (error) => {
+      clearTimeout(timeout);
+      res.status(500).json({ 
+        success: false, 
+        error: error.message,
+        apiKeyConfigured: true
+      });
+    });
+  } catch (error) {
+    res.status(500).json({ 
+      success: false, 
+      error: error.message 
+    });
+  }
+});
+
 const wss = new WebSocketServer({ 
   server,
   path: "/plugins/phone/stream",
@@ -57,9 +109,17 @@ const wss = new WebSocketServer({
 
 console.log("🎤 WebSocket server registered on /plugins/phone/stream");
 
+// Add connection attempt logging
+wss.on('headers', (headers, request) => {
+  console.log("🔍 WebSocket upgrade attempt - Headers:", headers);
+  console.log("🔍 Request headers:", request.headers);
+  console.log("🔍 Request URL:", request.url);
+});
+
 wss.on("connection", async (vonageWS, request) => {
-  console.log("📞 New Vonage WebSocket connection");
+  console.log("📞 New Vonage WebSocket connection ESTABLISHED");
   console.log("📞 Request URL:", request.url);
+  console.log("📞 Request headers:", JSON.stringify(request.headers, null, 2));
   
   const url = new URL(request.url || '', `http://${request.headers.host}`);
   const businessId = url.searchParams.get('business_id') || url.searchParams.get('assistant_id') || "default";
@@ -70,6 +130,45 @@ wss.on("connection", async (vonageWS, request) => {
   console.log(`🏢 Business: ${businessId}, Conversation: ${conversationId}`);
   console.log(`📞 From: ${fromNumber}, To: ${toNumber}`);
   
+  // Track call start time for duration calculation
+  const callStartTime = Date.now();
+  
+  // Create call log on main server
+  const apiUrl = process.env.REPLIT_APP_URL || 'https://myjoggle.replit.app';
+  const trackingSecret = process.env.CALL_TRACKING_SECRET;
+  
+  if (!trackingSecret) {
+    console.error('❌ FATAL: CALL_TRACKING_SECRET environment variable is not set!');
+    console.error('❌ Call tracking will be disabled. Conversation will NOT be logged or summarized.');
+  }
+  
+  const callTrackingHeaders = trackingSecret ? {
+    'Content-Type': 'application/json',
+    'X-Call-Tracking-Secret': trackingSecret
+  } : {
+    'Content-Type': 'application/json'
+  };
+  
+  if (trackingSecret) {
+    try {
+      await fetch(`${apiUrl}/api/phone/calls/start`, {
+        method: 'POST',
+        headers: callTrackingHeaders,
+        body: JSON.stringify({
+          conversationId,
+          businessId,
+          callerNumber: fromNumber,
+          callNumber: toNumber
+        })
+      });
+      console.log(`📝 Call log created for conversation: ${conversationId}`);
+    } catch (error) {
+      console.error('❌ Failed to create call log:', error.message);
+    }
+  } else {
+    console.warn('⚠️ Skipping call log creation - no tracking secret configured');
+  }
+  
   let openaiWS = null;
   let openaiReady = false;
   // Interruption handling state
@@ -79,6 +178,24 @@ wss.on("connection", async (vonageWS, request) => {
   let audioQueue = [];  // Buffer for queued audio packets
   let pendingResponseCreate = false;  // Flag to defer response.create until cancel confirmed
   let cancelTimeout = null;  // Timeout to prevent deadlock
+  
+  // Helper function to store conversation messages
+  const storeMessage = async (role, content) => {
+    if (!content || !trackingSecret) return;
+    try {
+      await fetch(`${apiUrl}/api/phone/calls/message`, {
+        method: 'POST',
+        headers: callTrackingHeaders,
+        body: JSON.stringify({
+          conversationId,
+          role,
+          content
+        })
+      });
+    } catch (error) {
+      console.error('❌ Failed to store message:', error.message);
+    }
+  }
 
   const sendOpenAI = (obj) => {
     if (openaiWS && openaiWS.readyState === WebSocket.OPEN) {
@@ -323,6 +440,24 @@ wss.on("connection", async (vonageWS, request) => {
             console.log("✅ Cancellation confirmed - creating new response");
             sendOpenAI({ type: "response.create" });
           }
+        } else if (evt.type === "conversation.item.created") {
+          // Track conversation messages
+          const item = evt.item;
+          if (item.role && item.content) {
+            const textContent = item.content
+              .filter(c => c.type === 'text' || c.type === 'input_text')
+              .map(c => c.text)
+              .join(' ');
+            
+            if (textContent) {
+              storeMessage(item.role, textContent);
+            }
+          }
+        } else if (evt.type === "response.audio_transcript.done") {
+          // Track assistant's transcribed speech
+          if (evt.transcript) {
+            storeMessage('assistant', evt.transcript);
+          }
         }
         
         // GA API uses response.output_audio.delta (not response.audio.delta)
@@ -400,17 +535,101 @@ wss.on("connection", async (vonageWS, request) => {
     console.error("❌ Vonage WebSocket error:", error);
   });
 
-  vonageWS.on("close", () => {
+  vonageWS.on("close", async () => {
     console.log("📞 Vonage connection closed");
     if (openaiWS) openaiWS.close();
+    
+    // End call log and trigger summary
+    const duration = Math.floor((Date.now() - callStartTime) / 1000);
+    if (trackingSecret) {
+      try {
+        await fetch(`${apiUrl}/api/phone/calls/end`, {
+          method: 'POST',
+          headers: callTrackingHeaders,
+          body: JSON.stringify({
+            conversationId,
+            duration
+          })
+        });
+        console.log(`✅ Call ended - duration: ${duration}s - summary will be generated`);
+      } catch (error) {
+        console.error('❌ Failed to end call log:', error.message);
+      }
+    } else {
+      console.warn('⚠️ Skipping call summary - no tracking secret configured');
+    }
   });
 });
 
 function getBusinessInstructions(bizId) {
   const profiles = {
-    wethreeloggerheads: "You are Joggle for We Three Loggerheads pub. Tone: warm, friendly, and welcoming. You can answer about opening hours, food menu, drinks, events, bookings, and general pub information. If caller wants to book a table, collect name, phone, date, time, and number of guests. Always be helpful and represent the pub's friendly atmosphere.",
-    abbeygaragedoors: "You are Joggle for Abbey Garage Doors NW. Tone: helpful, practical, local UK. You can answer about opening hours, service areas, new door quotes, repairs, emergency callouts, and booking callbacks. If urgent safety issue, reassure and offer to escalate to a human.",
-    default: "You are the business's Joggle phone assistant. Be concise, friendly, and interruptible. If unsure, ask a short clarifying question. Offer to leave a message or transfer to a human if needed."
+    wethreeloggerheads: `You are Joggle for We Three Loggerheads pub. Your PRIMARY GOAL: Understand exactly what the customer needs and help them.
+
+APPROACH:
+1. Listen carefully and let customers explain what they want
+2. Ask clarifying questions to fully understand their needs
+3. Confirm you've understood correctly before providing information
+4. Be thorough - make sure they get everything they need
+
+TONE: Warm, friendly, patient, and genuinely helpful. Make customers feel heard.
+
+YOU CAN HELP WITH: Opening hours, food menu, drinks, events, bookings, general pub information, directions, accessibility, dietary requirements.
+
+FOR TABLE BOOKINGS:
+- First confirm their preferred date, time, and party size
+- Check if they have any special requirements (high chairs, accessibility, dietary needs)
+- Then collect: name, phone number
+- Confirm all details back to them
+- Let them know what to expect next
+
+IMPORTANT: If you're not sure what they need, ask! Don't assume. Always check you've understood before moving on. Your job is to make sure they leave the call satisfied and with everything they needed.`,
+
+    abbeygaragedoors: `You are Joggle for Abbey Garage Doors NW. Your PRIMARY GOAL: Understand the customer's garage door issue or need, and help them get the right solution.
+
+APPROACH:
+1. Listen to their situation - what's the problem or what do they need?
+2. Ask questions to understand the full picture (type of door, urgency, what's wrong)
+3. Check you've understood their situation correctly
+4. Provide clear, practical help and next steps
+
+TONE: Helpful, reassuring, practical, local UK. Make customers feel their problem is understood and being handled.
+
+YOU CAN HELP WITH: Opening hours, service areas (North West England), new garage door quotes, repairs, emergency callouts, booking engineer visits, general advice.
+
+FOR ISSUES/REPAIRS:
+- First understand: What's happening? Is it urgent/safety issue? What type of door?
+- Confirm you understand the situation
+- Explain what can be done and timeframes
+- If urgent/safety issue, reassure them and get contact details to prioritize
+
+FOR NEW DOORS/QUOTES:
+- Understand what they're looking for and why
+- Ask about their requirements (size, style, automation)
+- Explain the process for getting a quote
+- Collect contact details and preferred callback time
+
+IMPORTANT: Take time to understand before jumping to solutions. Garage doors can be complex - make sure you know what they actually need. If something's unclear, ask! Better to check than assume.`,
+
+    default: `You are Joggle, this business's phone assistant. Your PRIMARY GOAL: Understand what the customer needs and genuinely help them.
+
+APPROACH:
+1. Listen carefully to what they want
+2. Ask questions if anything is unclear
+3. Confirm you understand their needs
+4. Provide helpful, accurate information or assistance
+5. Make sure they're satisfied before ending
+
+TONE: Friendly, patient, professional. Make customers feel listened to and helped.
+
+IMPORTANT PRINCIPLES:
+- Don't rush - take time to understand what they really need
+- Ask clarifying questions rather than guessing
+- Confirm understanding: "Just to make sure I've got this right..."
+- Be thorough - anticipate what else might help them
+- If you can't help with something, be honest and offer alternatives
+- Always check if there's anything else before finishing
+
+Remember: A helpful conversation is better than a quick one. Your job is to make customers feel truly helped.`
   };
   return profiles[bizId] || profiles.default;
 }
