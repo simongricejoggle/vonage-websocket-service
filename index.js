@@ -99,6 +99,61 @@ app.get('/test-openai', async (req, res) => {
   }
 });
 
+// NCCO Answer Webhook - Vonage calls this to get call instructions
+app.get('/plugins/phone/voice', (req, res) => {
+  console.log('📞 Vonage Answer Webhook called', {
+    from: req.query.from,
+    to: req.query.to,
+    conversation_uuid: req.query.conversation_uuid
+  });
+
+  const host = req.get('host'); // Railway domain
+  const from = req.query.from || 'unknown';
+  const to = req.query.to || 'unknown';
+  const conversationId = req.query.conversation_uuid || `${from}_${Date.now()}`;
+  const businessId = 'wethreeloggerheads'; // Default for We Three Loggerheads
+
+  // Build WebSocket URL on same Railway host (no Cloudflare)
+  const wsUrl = `wss://${host}/plugins/phone/stream?business_id=${encodeURIComponent(businessId)}&assistant_id=${encodeURIComponent(businessId)}&conversation_id=${encodeURIComponent(conversationId)}&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`;
+
+  const replit_url = process.env.REPLIT_APP_URL || 'https://joggle.ai';
+  
+  // Return NCCO with record + WebSocket connect
+  const ncco = [
+    {
+      action: "record",
+      eventUrl: [`${replit_url}/plugins/phone/recording`],
+      endOnSilence: 3,
+      format: "wav",
+      split: "conversation",
+      channels: 1,
+      beepStart: false
+    },
+    {
+      action: "connect",
+      eventType: "synchronous",
+      timeout: 10,
+      eventUrl: [`${replit_url}/plugins/phone/event`],
+      from: from,
+      endpoint: [
+        {
+          type: "websocket",
+          uri: wsUrl,
+          "content-type": "audio/l16;rate=16000"
+        }
+      ]
+    }
+  ];
+
+  console.log('📞 Returning NCCO:', JSON.stringify(ncco, null, 2));
+  
+  // Set proper headers to prevent caching
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  res.json(ncco);
+});
+
 const wss = new WebSocketServer({ 
   server,
   path: "/plugins/phone/stream",
@@ -149,22 +204,22 @@ wss.on("connection", async (vonageWS, request) => {
     'Content-Type': 'application/json'
   };
   
+  // Start call logging in background (non-blocking) so Vonage handshake isn't delayed
   if (trackingSecret) {
-    try {
-      await fetch(`${apiUrl}/api/phone/calls/start`, {
-        method: 'POST',
-        headers: callTrackingHeaders,
-        body: JSON.stringify({
-          conversationId,
-          businessId,
-          callerNumber: fromNumber,
-          callNumber: toNumber
-        })
-      });
+    fetch(`${apiUrl}/api/phone/calls/start`, {
+      method: 'POST',
+      headers: callTrackingHeaders,
+      body: JSON.stringify({
+        conversationId,
+        businessId,
+        callerNumber: fromNumber,
+        callNumber: toNumber
+      })
+    }).then(() => {
       console.log(`📝 Call log created for conversation: ${conversationId}`);
-    } catch (error) {
+    }).catch(error => {
       console.error('❌ Failed to create call log:', error.message);
-    }
+    });
   } else {
     console.warn('⚠️ Skipping call log creation - no tracking secret configured');
   }
