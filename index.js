@@ -31,7 +31,7 @@ function resample24to16(buffer24k) {
   return Buffer.from(samples16k.buffer);
 }
 
-const server = app.listen(PORT, () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ WebSocket server running on port ${PORT}`);
 });
 
