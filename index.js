@@ -388,20 +388,16 @@ wss.on("connection", async (vonageWS, request) => {
 
     openaiWS.on("open", async () => {
       console.log("🤖 OpenAI Realtime session connected");
-      console.log("⏳ Waiting for knowledge to load...");
       
-      // Wait for knowledge fetch to complete
-      const { voiceConfig: finalVoiceConfig, instructions } = await knowledgePromise;
-      
-      console.log("✅ Knowledge loaded, configuring session...");
-      
-      // Build session configuration with voice settings
-      const sessionConfig = {
+      // STEP 1: Configure IMMEDIATELY with minimal instructions (just the greeting)
+      // This allows us to send the greeting within 1-2 seconds
+      console.log("⚡ Configuring minimal session for immediate greeting...");
+      const minimalSessionConfig = {
         type: "session.update",
         session: {
           type: "realtime",
           model: "gpt-realtime",
-          instructions: instructions,
+          instructions: baseInstructions, // Just the base instructions, no knowledge yet
           audio: {
             input: {
               turn_detection: {
@@ -413,25 +409,60 @@ wss.on("connection", async (vonageWS, request) => {
               }
             },
             output: { 
-              voice: finalVoiceConfig.voice
+              voice: voiceConfig.voice || "ash" // Use default voice first
             }
           }
         }
       };
       
-      // Add speed if configured (and not default)
-      if (finalVoiceConfig.speed && finalVoiceConfig.speed !== 1.0) {
-        sessionConfig.session.speed = finalVoiceConfig.speed;
-        console.log(`⚡ Voice speed set to: ${finalVoiceConfig.speed}x`);
-      }
+      sendOpenAI(minimalSessionConfig);
+      openaiReady = true; // MARK AS READY IMMEDIATELY
+      console.log("✅ Minimal session configured - ready to send greeting");
       
-      sendOpenAI(sessionConfig);
-      openaiReady = true;
-      console.log("✅ OpenAI session configured, ready for audio");
-      console.log("📝 Full instructions length:", instructions.length);
-      
-      // Try sending greeting if Vonage is already ready
+      // STEP 2: Send greeting IMMEDIATELY (don't wait for knowledge)
       trySendGreeting();
+      
+      // STEP 3: Load full knowledge in background and UPDATE session (non-blocking)
+      knowledgePromise.then(({ voiceConfig: finalVoiceConfig, instructions }) => {
+        console.log("📚 Background: Full knowledge loaded, updating session...");
+        
+        // Build full session configuration with all knowledge
+        const fullSessionConfig = {
+          type: "session.update",
+          session: {
+            type: "realtime",
+            model: "gpt-realtime",
+            instructions: instructions, // Now with full knowledge
+            audio: {
+              input: {
+                turn_detection: {
+                  type: "server_vad",
+                  threshold: 0.5,
+                  prefix_padding_ms: 200,
+                  silence_duration_ms: 800,
+                  create_response: false
+                }
+              },
+              output: { 
+                voice: finalVoiceConfig.voice
+              }
+            }
+          }
+        };
+        
+        // Add speed if configured
+        if (finalVoiceConfig.speed && finalVoiceConfig.speed !== 1.0) {
+          fullSessionConfig.session.speed = finalVoiceConfig.speed;
+          console.log(`⚡ Voice speed set to: ${finalVoiceConfig.speed}x`);
+        }
+        
+        sendOpenAI(fullSessionConfig);
+        console.log("✅ Session updated with full knowledge in background");
+        console.log("📝 Full instructions length:", instructions.length);
+      }).catch(error => {
+        console.error("❌ Failed to load knowledge in background:", error);
+        // Session already configured with base instructions, so call continues
+      });
     });
 
     openaiWS.on("message", (raw) => {
