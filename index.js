@@ -264,25 +264,19 @@ wss.on("connection", async (vonageWS, request) => {
     
     // All systems ready - send greeting immediately!
     // Keep-alive will continue until FIRST audio delta arrives
-    console.log(`👋 Sending custom greeting (all systems ready)...`);
-    sendOpenAI({
-      type: "conversation.item.create",
-      item: {
-        type: "message",
-        role: "user",
-        content: [
-          {
-            type: "input_text",
-            text: `[SYSTEM: This is the start of the call. Greet the caller by saying exactly: "${welcomeGreeting}" and then wait for them to respond.]`
-          }
-        ]
+    console.log(`👋 Sending greeting instruction to OpenAI...`);
+    
+    // CRITICAL FIX: Use response.create with instructions to speak the greeting immediately
+    // This avoids creating a user message that OpenAI would need to respond to
+    sendOpenAI({ 
+      type: "response.create",
+      response: {
+        instructions: `Say this exact greeting immediately: "${welcomeGreeting}"`
       }
     });
     
-    // Trigger the greeting response
-    sendOpenAI({ type: "response.create" });
     greetingSent = true;
-    console.log(`✅ Greeting command sent successfully`);
+    console.log(`✅ Greeting instruction sent - OpenAI will speak immediately`);
   };
   
   // Helper function to store conversation messages
