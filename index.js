@@ -583,7 +583,7 @@ wss.on("connection", async (vonageWS, request) => {
     });
   };
 
-  vonageWS.on("message", async (raw) => {
+  vonageWS.on("message", (raw) => {
     try {
       // Vonage sends BOTH JSON control messages AND raw binary audio
       const isBuffer = Buffer.isBuffer(raw);
@@ -599,15 +599,18 @@ wss.on("connection", async (vonageWS, request) => {
         if (msg.event === "websocket:connected") {
           console.log("📞 Vonage connected, content-type:", msg['content-type']);
           
-          // CRITICAL: Send immediate silence AND start periodic keep-alive
-          // Vonage expects bidirectional audio immediately or it closes the connection
-          console.log("🔇 Starting keep-alive silence to Vonage (prevents premature disconnect)");
+          // CRITICAL: Send silence SYNCHRONOUSLY before any async operations
+          // Vonage expects immediate bidirectional audio or it disconnects within 200ms
           const silenceBuffer = Buffer.alloc(640, 0); // 20ms of silence (640 bytes = 320 samples @ 16kHz)
           
-          // Send first silence immediately
-          if (vonageWS.readyState === WebSocket.OPEN) {
-            vonageWS.send(silenceBuffer);
+          // Send multiple silence packets immediately (flood the connection to keep it alive)
+          console.log("🔇 Sending immediate silence burst to Vonage...");
+          for (let i = 0; i < 50; i++) {
+            if (vonageWS.readyState === WebSocket.OPEN) {
+              vonageWS.send(silenceBuffer);
+            }
           }
+          console.log("✅ Sent 50 silence packets (1 second of audio)");
           
           // Keep sending silence every 20ms until OpenAI is ready
           keepAliveInterval = setInterval(() => {
