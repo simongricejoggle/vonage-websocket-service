@@ -49,6 +49,32 @@ app.get('/health', (req, res) => {
   res.json({ healthy: true });
 });
 
+// Pre-warm endpoint - called by Replit server when NCCO is generated
+app.post('/prewarm', express.json(), async (req, res) => {
+  const { conversationId, businessId } = req.body;
+  
+  if (!conversationId || !businessId) {
+    return res.status(400).json({ 
+      success: false, 
+      error: 'Missing conversationId or businessId' 
+    });
+  }
+  
+  console.log(`🔥 Pre-warm request received for ${conversationId} (${businessId})`);
+  
+  // Start pre-warming in background (don't wait for it)
+  prewarmOpenAIConnection(conversationId, businessId)
+    .then(() => {
+      console.log(`✅ Pre-warm completed for ${conversationId}`);
+    })
+    .catch(err => {
+      console.error(`❌ Pre-warm failed for ${conversationId}:`, err.message);
+    });
+  
+  // Return immediately
+  res.json({ success: true, message: 'Pre-warming started' });
+});
+
 app.get('/test-openai', async (req, res) => {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
@@ -101,67 +127,8 @@ app.get('/test-openai', async (req, res) => {
   }
 });
 
-// NCCO Answer Webhook - Vonage calls this to get call instructions
-app.get('/plugins/phone/voice', (req, res) => {
-  console.log('📞 Vonage Answer Webhook called', {
-    from: req.query.from,
-    to: req.query.to,
-    conversation_uuid: req.query.conversation_uuid
-  });
-
-  const host = req.get('host'); // Railway domain
-  const from = req.query.from || 'unknown';
-  const to = req.query.to || 'unknown';
-  const conversationId = req.query.conversation_uuid || `${from}_${Date.now()}`;
-  const businessId = 'wethreeloggerheads'; // Default for We Three Loggerheads
-
-  // Build WebSocket URL on same Railway host (no Cloudflare)
-  const wsUrl = `wss://${host}/plugins/phone/stream?business_id=${encodeURIComponent(businessId)}&assistant_id=${encodeURIComponent(businessId)}&conversation_id=${encodeURIComponent(conversationId)}&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`;
-
-  const replit_url = process.env.REPLIT_APP_URL || 'https://joggle.ai';
-  
-  // Return NCCO with record + WebSocket connect
-  const ncco = [
-    {
-      action: "record",
-      eventUrl: [`${replit_url}/plugins/phone/recording`],
-      endOnSilence: 3,
-      format: "wav",
-      split: "conversation",
-      channels: 1,
-      beepStart: false
-    },
-    {
-      action: "connect",
-      eventType: "synchronous",
-      timeout: 10,
-      eventUrl: [`${replit_url}/plugins/phone/event`],
-      from: from,
-      endpoint: [
-        {
-          type: "websocket",
-          uri: wsUrl,
-          "content-type": "audio/l16;rate=16000"
-        }
-      ]
-    }
-  ];
-
-  console.log('📞 Returning NCCO:', JSON.stringify(ncco, null, 2));
-  
-  // 🚀 PRE-WARM OpenAI connection in background (non-blocking)
-  // This gives us ~2-5 seconds head start while Vonage connects
-  console.log(`🔥 PRE-WARMING OpenAI connection for ${conversationId}...`);
-  prewarmOpenAIConnection(conversationId, businessId).catch(err => {
-    console.error(`❌ Pre-warm failed for ${conversationId}:`, err.message);
-  });
-  
-  // Set proper headers to prevent caching
-  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
-  res.set('Pragma', 'no-cache');
-  res.set('Expires', '0');
-  res.json(ncco);
-});
+// NOTE: NCCO endpoint removed - it's handled by the main Replit server
+// The Replit server calls /prewarm endpoint above to trigger pre-warming
 
 const wss = new WebSocketServer({ 
   server,
@@ -445,14 +412,13 @@ wss.on("connection", async (vonageWS, request) => {
             console.log(`🎉 Greeting finished successfully`);
             
             // Apply full knowledge if it loaded
-            if (fullKnowledgeData && poolData.knowledge) {
-              const instructions = `You are a helpful assistant.\n\nKNOWLEDGE BASE:\n${poolData.knowledge}`;
+            if (fullKnowledgeData) {
               sendOpenAI({
                 type: "session.update",
                 session: {
                   type: "realtime",
                   model: "gpt-realtime",
-                  instructions: instructions,
+                  instructions: fullKnowledgeData.instructions,
                   audio: {
                     input: {
                       turn_detection: {
@@ -463,11 +429,11 @@ wss.on("connection", async (vonageWS, request) => {
                         create_response: false
                       }
                     },
-                    output: { voice: poolData.voiceConfig.voice || "ash" }
+                    output: { voice: fullKnowledgeData.voiceConfig?.voice || "ash" }
                   }
                 }
               });
-              console.log(`✅ Session updated with full knowledge`);
+              console.log(`✅ Session updated with full knowledge from pre-warmed connection`);
             }
           }
         }
@@ -992,9 +958,31 @@ wss.on("connection", async (vonageWS, request) => {
             console.log(`🎯 Found pre-warmed connection for ${conversationId} - using it!`);
             const poolData = prewarmPool.get(conversationId);
             
+            // CRITICAL: Remove from pool immediately to prevent cleanup timer from closing it
+            prewarmPool.delete(conversationId);
+            
             // Use the pre-warmed connection
             openaiWS = poolData.ws;
             welcomeGreeting = poolData.welcomeGreeting;
+            
+            // CRITICAL: Populate fullKnowledgeData so knowledge gets applied after greeting
+            if (poolData.knowledge) {
+              let instructions = "";
+              if (poolData.languagePrompt) {
+                instructions = `${poolData.languagePrompt}\n\n==========\n\n`;
+              }
+              instructions += "You are a helpful assistant.";
+              instructions += `\n\nKNOWLEDGE BASE:\n${poolData.knowledge}`;
+              if (poolData.voiceInstructions) {
+                instructions += poolData.voiceInstructions;
+              }
+              
+              fullKnowledgeData = {
+                voiceConfig: poolData.voiceConfig,
+                instructions: instructions
+              };
+              console.log(`📚 Knowledge loaded from pre-warmed connection (${instructions.length} chars)`);
+            }
             
             // If already ready, mark it immediately
             if (poolData.ready) {
@@ -1004,19 +992,15 @@ wss.on("connection", async (vonageWS, request) => {
               // Set up event handlers for the pre-warmed connection
               setupPrewarmedConnection(poolData);
               
-              // Remove from pool (we're using it now)
-              prewarmPool.delete(conversationId);
-              
               // Try sending greeting immediately
               trySendGreeting();
             } else {
               console.log(`⏳ Pre-warmed connection still initializing...`);
               // Set up event handlers and wait for ready
               setupPrewarmedConnection(poolData);
-              prewarmPool.delete(conversationId);
             }
           } else {
-            console.log(`⚠️ No pre-warmed connection found for ${conversationId} - creating new one`);
+            console.log(`⚠️ No pre-warmed connection found for ${conversationId} - falling back to creating new one`);
             // Fallback to creating new connection
             createOpenAIConnection().catch(error => {
               console.error("❌ Fatal error in OpenAI connection setup:", error);
