@@ -314,76 +314,76 @@ wss.on("connection", async (vonageWS, request) => {
     const model = "gpt-realtime";
     const baseInstructions = getBusinessInstructions(businessId);
     
-    // Fetch knowledge base and voice settings from main app
-    let knowledge = "";
-    let voiceConfig = { voice: "alloy", speed: 1.0 };
-    let voiceInstructions = "";
-    let languagePrompt = "";
-    // Don't redeclare welcomeGreeting - use the outer scope variable
-    
-    try {
-      const knowledgeUrl = `${process.env.REPLIT_APP_URL || 'https://myjoggle.replit.app'}/api/phone/knowledge/${businessId}`;
-      console.log(`📚 Fetching knowledge from: ${knowledgeUrl}`);
-      
-      const response = await fetch(knowledgeUrl);
-      if (response.ok) {
-        const data = await response.json();
-        if (data.success) {
-          knowledge = data.knowledge || "";
-          voiceConfig = data.voiceConfig || { voice: "alloy", speed: 1.0 };
-          voiceInstructions = data.voiceInstructions || "";
-          languagePrompt = data.languagePrompt || "";
-          // Store welcome greeting in outer scope for trySendGreeting()
-          welcomeGreeting = voiceConfig.welcomeGreeting || welcomeGreeting;
-          console.log(`✅ Retrieved ${knowledge.length} chars of knowledge`);
-          console.log(`🎙️ Voice config:`, voiceConfig);
-          console.log(`👋 Welcome greeting: ${welcomeGreeting}`);
-          if (languagePrompt) {
-            console.log(`🌍 Language prompt: ${languagePrompt.substring(0, 100)}...`);
-          }
-        }
-      } else {
-        console.log(`⚠️ Knowledge fetch failed: ${response.status}`);
-      }
-    } catch (error) {
-      console.log(`⚠️ Could not fetch knowledge:`, error.message);
-    }
-    
-    // Combine instructions - LANGUAGE FIRST (if non-English), then base, then knowledge, then voice style
-    let instructions = "";
-    
-    // Add language prompt first if non-English (same as webapp)
-    if (languagePrompt) {
-      instructions = `${languagePrompt}\n\n==========\n\n`;
-      console.log(`🌍 Voice session using non-English language`);
-    }
-    
-    // Then base instructions
-    instructions += baseInstructions;
-    
-    // Then knowledge base
-    if (knowledge) {
-      instructions += `\n\nKNOWLEDGE BASE:\n${knowledge}`;
-    }
-    
-    // Then voice style instructions
-    if (voiceInstructions) {
-      instructions += voiceInstructions;
-    }
-    
-    // Enforce English by default unless a non-English language is explicitly set
-    if (!voiceConfig.language || voiceConfig.language === 'en-GB' || voiceConfig.language === 'en-US') {
-      instructions += "\n\nIMPORTANT: Always respond in English only.";
-    }
-    
     console.log(`🤖 Creating OpenAI connection for business: ${businessId}`);
+    console.log(`⚡ FAST MODE: Connecting to OpenAI immediately, fetching knowledge in parallel`);
     
+    // CONNECT TO OPENAI IMMEDIATELY (don't wait for knowledge fetch)
     openaiWS = new WebSocket(`wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`, {
       headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }
     });
+    
+    // FETCH KNOWLEDGE IN PARALLEL (don't block OpenAI connection)
+    let voiceConfig = { voice: "alloy", speed: 1.0 };
+    const knowledgePromise = (async () => {
+      let knowledge = "";
+      let voiceInstructions = "";
+      let languagePrompt = "";
+      
+      try {
+        const knowledgeUrl = `${process.env.REPLIT_APP_URL || 'https://myjoggle.replit.app'}/api/phone/knowledge/${businessId}`;
+        console.log(`📚 Fetching knowledge from: ${knowledgeUrl}`);
+        
+        const response = await fetch(knowledgeUrl);
+        if (response.ok) {
+          const data = await response.json();
+          if (data.success) {
+            knowledge = data.knowledge || "";
+            voiceConfig = data.voiceConfig || { voice: "alloy", speed: 1.0 };
+            voiceInstructions = data.voiceInstructions || "";
+            languagePrompt = data.languagePrompt || "";
+            // Store welcome greeting in outer scope for trySendGreeting()
+            welcomeGreeting = voiceConfig.welcomeGreeting || welcomeGreeting;
+            console.log(`✅ Retrieved ${knowledge.length} chars of knowledge`);
+            console.log(`🎙️ Voice config:`, voiceConfig);
+            console.log(`👋 Welcome greeting: ${welcomeGreeting}`);
+            if (languagePrompt) {
+              console.log(`🌍 Language prompt: ${languagePrompt.substring(0, 100)}...`);
+            }
+          }
+        } else {
+          console.log(`⚠️ Knowledge fetch failed: ${response.status}`);
+        }
+      } catch (error) {
+        console.log(`⚠️ Could not fetch knowledge:`, error.message);
+      }
+      
+      // Combine instructions
+      let instructions = "";
+      if (languagePrompt) {
+        instructions = `${languagePrompt}\n\n==========\n\n`;
+      }
+      instructions += baseInstructions;
+      if (knowledge) {
+        instructions += `\n\nKNOWLEDGE BASE:\n${knowledge}`;
+      }
+      if (voiceInstructions) {
+        instructions += voiceInstructions;
+      }
+      if (!voiceConfig.language || voiceConfig.language === 'en-GB' || voiceConfig.language === 'en-US') {
+        instructions += "\n\nIMPORTANT: Always respond in English only.";
+      }
+      
+      return { knowledge, voiceConfig, instructions };
+    })();
 
-    openaiWS.on("open", () => {
+    openaiWS.on("open", async () => {
       console.log("🤖 OpenAI Realtime session connected");
+      console.log("⏳ Waiting for knowledge to load...");
+      
+      // Wait for knowledge fetch to complete
+      const { voiceConfig: finalVoiceConfig, instructions } = await knowledgePromise;
+      
+      console.log("✅ Knowledge loaded, configuring session...");
       
       // Build session configuration with voice settings
       const sessionConfig = {
@@ -396,23 +396,23 @@ wss.on("connection", async (vonageWS, request) => {
             input: {
               turn_detection: {
                 type: "server_vad",
-                threshold: 0.5,  // Balanced sensitivity for natural conversation (0.0-1.0, higher = more sensitive)
-                prefix_padding_ms: 200,   // Natural padding to capture full speech start
-                silence_duration_ms: 800,  // Allow natural pauses without AI jumping in too quickly
-                create_response: false  // Manual control for better interruption handling
+                threshold: 0.5,
+                prefix_padding_ms: 200,
+                silence_duration_ms: 800,
+                create_response: false
               }
             },
             output: { 
-              voice: voiceConfig.voice
+              voice: finalVoiceConfig.voice
             }
           }
         }
       };
       
       // Add speed if configured (and not default)
-      if (voiceConfig.speed && voiceConfig.speed !== 1.0) {
-        sessionConfig.session.speed = voiceConfig.speed;
-        console.log(`⚡ Voice speed set to: ${voiceConfig.speed}x`);
+      if (finalVoiceConfig.speed && finalVoiceConfig.speed !== 1.0) {
+        sessionConfig.session.speed = finalVoiceConfig.speed;
+        console.log(`⚡ Voice speed set to: ${finalVoiceConfig.speed}x`);
       }
       
       sendOpenAI(sessionConfig);
