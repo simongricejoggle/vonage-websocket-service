@@ -601,20 +601,18 @@ wss.on("connection", async (vonageWS, request) => {
         if (msg.event === "websocket:connected") {
           console.log("📞 Vonage connected, content-type:", msg['content-type']);
           
-          // CRITICAL: Send silence SYNCHRONOUSLY before any async operations
-          // Vonage expects immediate bidirectional audio or it disconnects within 200ms
+          // CRITICAL: Vonage expects audio at exactly 50 packets/second (one 640-byte packet every 20ms)
+          // Sending packets too fast causes buffer overflow and disconnection
           const silenceBuffer = Buffer.alloc(640, 0); // 20ms of silence (640 bytes = 320 samples @ 16kHz)
           
-          // Send multiple silence packets immediately (flood the connection to keep it alive)
-          console.log("🔇 Sending immediate silence burst to Vonage...");
-          for (let i = 0; i < 50; i++) {
-            if (vonageWS.readyState === WebSocket.OPEN) {
-              vonageWS.send(silenceBuffer);
-            }
+          // Send first silence packet immediately (synchronous - no delay)
+          console.log("🔇 Starting silence keep-alive at proper rate (50 packets/second)...");
+          if (vonageWS.readyState === WebSocket.OPEN) {
+            vonageWS.send(silenceBuffer);
           }
-          console.log("✅ Sent 50 silence packets (1 second of audio)");
           
-          // Keep sending silence every 20ms until OpenAI is ready
+          // Start keep-alive interval IMMEDIATELY at correct pace (20ms = 50 packets/second)
+          // This maintains the connection while OpenAI connects
           keepAliveInterval = setInterval(() => {
             if (vonageWS.readyState === WebSocket.OPEN && !openaiReady) {
               vonageWS.send(silenceBuffer);
@@ -623,9 +621,10 @@ wss.on("connection", async (vonageWS, request) => {
               if (keepAliveInterval) {
                 clearInterval(keepAliveInterval);
                 keepAliveInterval = null;
+                console.log("🛑 Stopped silence keep-alive");
               }
             }
-          }, 20); // 20ms intervals (matching Vonage's audio packet rate)
+          }, 20); // 20ms intervals = 50 packets/second (Vonage's expected audio rate)
           
           // Mark Vonage as ready
           vonageStreamReady = true;
