@@ -1,3 +1,5 @@
+// Vonage WebSocket Service v1.1 - Parallel OpenAI + Silence Keep-Alive
+// Updated: Nov 14, 2025 - Fixed immediate greeting with parallel connection
 require('dotenv').config();
 const express = require('express');
 const { WebSocketServer } = require('ws');
