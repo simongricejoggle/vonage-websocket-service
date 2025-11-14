@@ -232,6 +232,10 @@ wss.on("connection", async (vonageWS, request) => {
   let greetingSent = false;
   let welcomeGreeting = "Hi, this is Joggle answering for your business.";
   let keepAliveInterval = null;
+  let firstAudioReceived = false;  // Track when first audio arrives to stop keep-alive
+  let greetingResponseId = null;  // Track greeting response to defer full session update
+  let fullKnowledgeData = null;  // Store full knowledge/voice config for deferred session update
+  let greetingComplete = false;  // Track if greeting has finished (for late knowledge application)
   
   // Interruption handling state
   let activeResponseId = null;
@@ -258,14 +262,8 @@ wss.on("connection", async (vonageWS, request) => {
       return;
     }
     
-    // Stop keep-alive - OpenAI will now send real audio
-    if (keepAliveInterval) {
-      clearInterval(keepAliveInterval);
-      keepAliveInterval = null;
-      console.log(`🛑 Stopped keep-alive silence (OpenAI will send real audio now)`);
-    }
-    
-    // All systems ready - send greeting!
+    // All systems ready - send greeting immediately!
+    // Keep-alive will continue until FIRST audio delta arrives
     console.log(`👋 Sending custom greeting (all systems ready)...`);
     sendOpenAI({
       type: "conversation.item.create",
@@ -284,7 +282,7 @@ wss.on("connection", async (vonageWS, request) => {
     // Trigger the greeting response
     sendOpenAI({ type: "response.create" });
     greetingSent = true;
-    console.log(`✅ Greeting sent successfully`);
+    console.log(`✅ Greeting command sent successfully`);
   };
   
   // Helper function to store conversation messages
@@ -389,8 +387,7 @@ wss.on("connection", async (vonageWS, request) => {
     openaiWS.on("open", async () => {
       console.log("🤖 OpenAI Realtime session connected");
       
-      // STEP 1: Configure IMMEDIATELY with minimal instructions (just the greeting)
-      // This allows us to send the greeting within 1-2 seconds
+      // Configure with minimal session immediately (base instructions only)
       console.log("⚡ Configuring minimal session for immediate greeting...");
       const minimalSessionConfig = {
         type: "session.update",
@@ -416,52 +413,53 @@ wss.on("connection", async (vonageWS, request) => {
       };
       
       sendOpenAI(minimalSessionConfig);
-      openaiReady = true; // MARK AS READY IMMEDIATELY
-      console.log("✅ Minimal session configured - ready to send greeting");
+      // DON'T set openaiReady here - wait for session.updated event!
+      console.log("⏳ Waiting for session.updated confirmation...");
       
-      // STEP 2: Send greeting IMMEDIATELY (don't wait for knowledge)
-      trySendGreeting();
-      
-      // STEP 3: Load full knowledge in background and UPDATE session (non-blocking)
+      // Load full knowledge in background (will be applied AFTER greeting finishes)
       knowledgePromise.then(({ voiceConfig: finalVoiceConfig, instructions }) => {
-        console.log("📚 Background: Full knowledge loaded, updating session...");
+        console.log("📚 Background: Full knowledge loaded");
+        console.log("📝 Full instructions length:", instructions.length);
         
-        // Build full session configuration with all knowledge
-        const fullSessionConfig = {
-          type: "session.update",
-          session: {
-            type: "realtime",
-            model: "gpt-realtime",
-            instructions: instructions, // Now with full knowledge
-            audio: {
-              input: {
-                turn_detection: {
-                  type: "server_vad",
-                  threshold: 0.5,
-                  prefix_padding_ms: 200,
-                  silence_duration_ms: 800,
-                  create_response: false
-                }
-              },
-              output: { 
-                voice: finalVoiceConfig.voice
-              }
-            }
-          }
+        // Store knowledge data
+        fullKnowledgeData = {
+          voiceConfig: finalVoiceConfig,
+          instructions: instructions
         };
         
-        // Add speed if configured
-        if (finalVoiceConfig.speed && finalVoiceConfig.speed !== 1.0) {
-          fullSessionConfig.session.speed = finalVoiceConfig.speed;
-          console.log(`⚡ Voice speed set to: ${finalVoiceConfig.speed}x`);
+        // If greeting already finished, apply knowledge immediately
+        if (greetingComplete && openaiWS && openaiWS.readyState === WebSocket.OPEN) {
+          console.log("🎉 Greeting already done - applying knowledge now!");
+          const fullSessionConfig = {
+            type: "session.update",
+            session: {
+              type: "realtime",
+              model: "gpt-realtime",
+              instructions: instructions,
+              audio: {
+                input: {
+                  turn_detection: {
+                    type: "server_vad",
+                    threshold: 0.5,
+                    prefix_padding_ms: 200,
+                    silence_duration_ms: 800,
+                    create_response: false
+                  }
+                },
+                output: { voice: finalVoiceConfig.voice }
+              }
+            }
+          };
+          
+          if (finalVoiceConfig.speed && finalVoiceConfig.speed !== 1.0) {
+            fullSessionConfig.session.speed = finalVoiceConfig.speed;
+          }
+          
+          sendOpenAI(fullSessionConfig);
+          console.log("✅ Session updated with full knowledge (late arrival)");
         }
-        
-        sendOpenAI(fullSessionConfig);
-        console.log("✅ Session updated with full knowledge in background");
-        console.log("📝 Full instructions length:", instructions.length);
       }).catch(error => {
         console.error("❌ Failed to load knowledge in background:", error);
-        // Session already configured with base instructions, so call continues
       });
     });
 
@@ -474,11 +472,27 @@ wss.on("connection", async (vonageWS, request) => {
           console.log(`🔔 OpenAI event: ${evt.type}`);
         }
         
+        // CRITICAL: Wait for session.updated before marking OpenAI as ready
+        if (evt.type === "session.updated") {
+          if (!openaiReady) {
+            openaiReady = true;
+            console.log("✅ Session confirmed ready - can now send greeting");
+            // Trigger greeting now that session is confirmed ready
+            trySendGreeting();
+          }
+        }
+        
         // Track response lifecycle for interruption handling
         if (evt.type === "response.created") {
           activeResponseId = evt.response?.id || null;
           pendingResponseCreate = false;  // Clear pending flag
           console.log(`🎯 Response created: ${activeResponseId}`);
+          
+          // Capture the greeting response ID (first response after greetingSent)
+          if (greetingSent && !greetingResponseId) {
+            greetingResponseId = activeResponseId;
+            console.log(`🎤 Greeting response ID captured: ${greetingResponseId}`);
+          }
         } else if (evt.type === "response.output_item.added") {
           // Track output item ID for potential truncation
           activeItemId = evt.item?.id || null;
@@ -550,6 +564,61 @@ wss.on("connection", async (vonageWS, request) => {
           const wasCancelled = evt.type === "response.cancelled";
           console.log(wasCancelled ? "🚫 Response cancelled" : "✅ Response completed");
           
+          // CRITICAL: Check if this is the greeting response BEFORE clearing greetingResponseId
+          const isGreetingResponse = greetingResponseId && evt.response?.id === greetingResponseId;
+          
+          // Error recovery: If GREETING was cancelled, reset state to allow retry
+          if (wasCancelled && isGreetingResponse) {
+            console.log("⚠️ Greeting was cancelled - resetting state for retry");
+            greetingSent = false;
+            greetingResponseId = null;
+            firstAudioReceived = false;
+            greetingComplete = false;
+          }
+          // If greeting completed successfully, update session with full knowledge
+          else if (!wasCancelled && isGreetingResponse) {
+            console.log("🎉 Greeting finished successfully");
+            greetingComplete = true;  // Mark greeting as complete
+            greetingResponseId = null;  // Clear so we don't re-trigger
+            
+            // Send full session update if knowledge is ready NOW
+            if (fullKnowledgeData) {
+              const { voiceConfig: finalVoiceConfig, instructions } = fullKnowledgeData;
+              const fullSessionConfig = {
+                type: "session.update",
+                session: {
+                  type: "realtime",
+                  model: "gpt-realtime",
+                  instructions: instructions, // Full knowledge now included
+                  audio: {
+                    input: {
+                      turn_detection: {
+                        type: "server_vad",
+                        threshold: 0.5,
+                        prefix_padding_ms: 200,
+                        silence_duration_ms: 800,
+                        create_response: false
+                      }
+                    },
+                    output: { 
+                      voice: finalVoiceConfig.voice
+                    }
+                  }
+                }
+              };
+              
+              // Add speed if configured
+              if (finalVoiceConfig.speed && finalVoiceConfig.speed !== 1.0) {
+                fullSessionConfig.session.speed = finalVoiceConfig.speed;
+              }
+              
+              sendOpenAI(fullSessionConfig);
+              console.log("✅ Session updated with full knowledge and voice settings");
+            } else {
+              console.log("⏳ Knowledge not ready yet - will apply when it arrives");
+            }
+          }
+          
           // Clear active response and item
           activeResponseId = null;
           activeItemId = null;
@@ -586,6 +655,16 @@ wss.on("connection", async (vonageWS, request) => {
         
         // GA API uses response.output_audio.delta (not response.audio.delta)
         if (evt.type === "response.output_audio.delta" && evt.delta) {
+          // CRITICAL: Stop keep-alive on FIRST audio delta
+          if (!firstAudioReceived) {
+            firstAudioReceived = true;
+            if (keepAliveInterval) {
+              clearInterval(keepAliveInterval);
+              keepAliveInterval = null;
+              console.log("🛑 Stopped keep-alive (first real audio received from OpenAI)");
+            }
+          }
+          
           // Only forward audio if AI is still speaking (not interrupted)
           if (isAiSpeaking) {
             sendVonageAudio(evt.delta);
@@ -643,16 +722,16 @@ wss.on("connection", async (vonageWS, request) => {
           }
           
           // Start keep-alive interval IMMEDIATELY at correct pace (20ms = 50 packets/second)
-          // This maintains the connection while OpenAI connects
+          // Keep running until FIRST real audio arrives from OpenAI (not just when openaiReady flag is set)
           keepAliveInterval = setInterval(() => {
-            if (vonageWS.readyState === WebSocket.OPEN && !openaiReady) {
+            if (vonageWS.readyState === WebSocket.OPEN) {
               vonageWS.send(silenceBuffer);
-            } else if (openaiReady || vonageWS.readyState !== WebSocket.OPEN) {
-              // Stop if OpenAI is ready or Vonage disconnected
+            } else {
+              // Stop only if Vonage disconnected
               if (keepAliveInterval) {
                 clearInterval(keepAliveInterval);
                 keepAliveInterval = null;
-                console.log("🛑 Stopped silence keep-alive");
+                console.log("🛑 Stopped silence keep-alive (Vonage disconnected)");
               }
             }
           }, 20); // 20ms intervals = 50 packets/second (Vonage's expected audio rate)
@@ -665,7 +744,7 @@ wss.on("connection", async (vonageWS, request) => {
             console.error("❌ Fatal error in OpenAI connection setup:", error);
           });
           
-          // Try sending greeting (will wait for OpenAI if not ready yet)
+          // Try sending greeting if OpenAI already ready (handles race condition)
           trySendGreeting();
         }
       } else {
