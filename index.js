@@ -149,6 +149,13 @@ app.get('/plugins/phone/voice', (req, res) => {
 
   console.log('📞 Returning NCCO:', JSON.stringify(ncco, null, 2));
   
+  // 🚀 PRE-WARM OpenAI connection in background (non-blocking)
+  // This gives us ~2-5 seconds head start while Vonage connects
+  console.log(`🔥 PRE-WARMING OpenAI connection for ${conversationId}...`);
+  prewarmOpenAIConnection(conversationId, businessId).catch(err => {
+    console.error(`❌ Pre-warm failed for ${conversationId}:`, err.message);
+  });
+  
   // Set proper headers to prevent caching
   res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
   res.set('Pragma', 'no-cache');
@@ -165,6 +172,128 @@ const wss = new WebSocketServer({
 });
 
 console.log("🎤 WebSocket server registered on /plugins/phone/stream");
+
+// Connection pool for pre-warmed OpenAI sessions
+const prewarmPool = new Map();
+
+// Pre-warm OpenAI connection function
+async function prewarmOpenAIConnection(conversationId, businessId) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    throw new Error('OPENAI_API_KEY not configured');
+  }
+
+  console.log(`🔥 Starting pre-warm for conversation: ${conversationId}`);
+  
+  const ws = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01', {
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'OpenAI-Beta': 'realtime=v1'
+    }
+  });
+
+  // Store in pool immediately
+  prewarmPool.set(conversationId, {
+    ws,
+    ready: false,
+    businessId,
+    timestamp: Date.now(),
+    welcomeGreeting: "Hi, this is Joggle answering for your business.",
+    voiceConfig: { voice: "ash", speed: 1.0 }
+  });
+
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(new Error('Pre-warm connection timeout'));
+    }, 15000);
+
+    ws.on('open', () => {
+      console.log(`✅ Pre-warmed OpenAI connected for ${conversationId}`);
+      
+      // Send minimal session config
+      const sessionConfig = {
+        type: "session.update",
+        session: {
+          type: "realtime",
+          model: "gpt-realtime",
+          instructions: "You are a helpful assistant. When connected, greet the caller immediately.",
+          audio: {
+            input: {
+              turn_detection: {
+                type: "server_vad",
+                threshold: 0.5,
+                prefix_padding_ms: 200,
+                silence_duration_ms: 800,
+                create_response: false
+              }
+            },
+            output: { voice: "ash" }
+          }
+        }
+      };
+      
+      ws.send(JSON.stringify(sessionConfig));
+      
+      // Fetch knowledge in background
+      const knowledgeUrl = `${process.env.REPLIT_APP_URL || 'https://myjoggle.replit.app'}/api/phone/knowledge/${businessId}`;
+      fetch(knowledgeUrl)
+        .then(r => r.json())
+        .then(data => {
+          if (data.success && prewarmPool.has(conversationId)) {
+            const poolData = prewarmPool.get(conversationId);
+            poolData.welcomeGreeting = data.voiceConfig?.welcomeGreeting || poolData.welcomeGreeting;
+            poolData.voiceConfig = data.voiceConfig || poolData.voiceConfig;
+            poolData.knowledge = data.knowledge;
+            poolData.languagePrompt = data.languagePrompt;
+            poolData.voiceInstructions = data.voiceInstructions;
+            console.log(`📚 Knowledge loaded for pre-warmed connection: ${conversationId}`);
+          }
+        })
+        .catch(err => console.log(`⚠️ Knowledge fetch failed:`, err.message));
+    });
+
+    ws.on('message', (raw) => {
+      try {
+        const evt = JSON.parse(raw.toString());
+        if (evt.type === 'session.updated' && prewarmPool.has(conversationId)) {
+          const poolData = prewarmPool.get(conversationId);
+          poolData.ready = true;
+          console.log(`🎯 Pre-warmed session ready: ${conversationId}`);
+          clearTimeout(timeout);
+          resolve();
+        }
+      } catch (err) {
+        // Ignore parse errors
+      }
+    });
+
+    ws.on('error', (error) => {
+      console.error(`❌ Pre-warm WebSocket error for ${conversationId}:`, error.message);
+      clearTimeout(timeout);
+      prewarmPool.delete(conversationId);
+      reject(error);
+    });
+
+    ws.on('close', () => {
+      console.log(`📞 Pre-warmed connection closed: ${conversationId}`);
+      clearTimeout(timeout);
+    });
+  });
+}
+
+// Cleanup old pre-warmed connections after 30 seconds
+setInterval(() => {
+  const now = Date.now();
+  for (const [conversationId, data] of prewarmPool.entries()) {
+    if (now - data.timestamp > 30000) {
+      console.log(`🧹 Cleaning up expired pre-warmed connection: ${conversationId}`);
+      if (data.ws && data.ws.readyState === WebSocket.OPEN) {
+        data.ws.close();
+      }
+      prewarmPool.delete(conversationId);
+    }
+  }
+}, 5000);
 
 // Add connection attempt logging
 wss.on('headers', (headers, request) => {
@@ -248,6 +377,114 @@ wss.on("connection", async (vonageWS, request) => {
   let earlyAudioBuffer = [];  // Buffer audio deltas that arrive before Vonage is ready
   
   console.log("🔄 Call state initialized for conversation:", conversationId);
+  
+  // Helper function to setup pre-warmed connection with event handlers
+  const setupPrewarmedConnection = (poolData) => {
+    console.log(`🔌 Setting up pre-warmed connection event handlers`);
+    
+    // Helper to send messages to OpenAI
+    const sendOpenAI = (data) => {
+      if (openaiWS && openaiWS.readyState === WebSocket.OPEN) {
+        openaiWS.send(JSON.stringify(data));
+      }
+    };
+    
+    // Listen for session.updated events to mark as ready
+    openaiWS.on('message', (raw) => {
+      try {
+        const evt = JSON.parse(raw.toString());
+        
+        if (evt.type === 'session.updated' && !openaiReady) {
+          openaiReady = true;
+          console.log(`✅ Pre-warmed session confirmed ready`);
+          trySendGreeting();
+        }
+        
+        // Handle response lifecycle
+        if (evt.type === "response.created") {
+          activeResponseId = evt.response.id;
+          console.log(`🎯 Response created: ${activeResponseId}`);
+          
+          if (greetingResponseId === null) {
+            greetingResponseId = activeResponseId;
+            console.log(`🎤 Greeting response ID captured: ${greetingResponseId}`);
+          }
+        }
+        
+        if (evt.type === "response.output_item.added") {
+          activeItemId = evt.item.id;
+          isAiSpeaking = true;
+          console.log(`🔊 AI started speaking - item: ${activeItemId}`);
+        }
+        
+        if (evt.type === "response.output_audio.delta" && evt.delta) {
+          if (!firstAudioReceived) {
+            firstAudioReceived = true;
+            if (keepAliveInterval) {
+              clearInterval(keepAliveInterval);
+              keepAliveInterval = null;
+              console.log("🛑 Stopped keep-alive (first real audio from pre-warmed)");
+            }
+          }
+          
+          if (isAiSpeaking) {
+            if (!vonageStreamReady) {
+              earlyAudioBuffer.push(evt.delta);
+            } else {
+              sendVonageAudio(evt.delta);
+            }
+          }
+        }
+        
+        if (evt.type === "response.done") {
+          isAiSpeaking = false;
+          console.log(`✅ Response completed`);
+          
+          if (greetingResponseId && evt.response.id === greetingResponseId) {
+            greetingComplete = true;
+            console.log(`🎉 Greeting finished successfully`);
+            
+            // Apply full knowledge if it loaded
+            if (fullKnowledgeData && poolData.knowledge) {
+              const instructions = `You are a helpful assistant.\n\nKNOWLEDGE BASE:\n${poolData.knowledge}`;
+              sendOpenAI({
+                type: "session.update",
+                session: {
+                  type: "realtime",
+                  model: "gpt-realtime",
+                  instructions: instructions,
+                  audio: {
+                    input: {
+                      turn_detection: {
+                        type: "server_vad",
+                        threshold: 0.5,
+                        prefix_padding_ms: 200,
+                        silence_duration_ms: 800,
+                        create_response: false
+                      }
+                    },
+                    output: { voice: poolData.voiceConfig.voice || "ash" }
+                  }
+                }
+              });
+              console.log(`✅ Session updated with full knowledge`);
+            }
+          }
+        }
+      } catch (err) {
+        // Ignore parse errors
+      }
+    });
+    
+    openaiWS.on('error', (error) => {
+      console.error("❌ Pre-warmed OpenAI error:", error);
+    });
+    
+    openaiWS.on('close', () => {
+      console.log("🤖 Pre-warmed OpenAI closed");
+      openaiReady = false;
+    });
+  };
   
   // Helper function to send greeting when both systems are ready
   const trySendGreeting = () => {
@@ -750,10 +987,41 @@ wss.on("connection", async (vonageWS, request) => {
             console.log("✅ Skipping keep-alive - real audio already received");
           }
           
-          // Start OpenAI connection in background (non-blocking)
-          createOpenAIConnection().catch(error => {
-            console.error("❌ Fatal error in OpenAI connection setup:", error);
-          });
+          // Check if we have a pre-warmed connection ready
+          if (prewarmPool.has(conversationId)) {
+            console.log(`🎯 Found pre-warmed connection for ${conversationId} - using it!`);
+            const poolData = prewarmPool.get(conversationId);
+            
+            // Use the pre-warmed connection
+            openaiWS = poolData.ws;
+            welcomeGreeting = poolData.welcomeGreeting;
+            
+            // If already ready, mark it immediately
+            if (poolData.ready) {
+              openaiReady = true;
+              console.log(`⚡ Pre-warmed connection already ready - can send greeting now!`);
+              
+              // Set up event handlers for the pre-warmed connection
+              setupPrewarmedConnection(poolData);
+              
+              // Remove from pool (we're using it now)
+              prewarmPool.delete(conversationId);
+              
+              // Try sending greeting immediately
+              trySendGreeting();
+            } else {
+              console.log(`⏳ Pre-warmed connection still initializing...`);
+              // Set up event handlers and wait for ready
+              setupPrewarmedConnection(poolData);
+              prewarmPool.delete(conversationId);
+            }
+          } else {
+            console.log(`⚠️ No pre-warmed connection found for ${conversationId} - creating new one`);
+            // Fallback to creating new connection
+            createOpenAIConnection().catch(error => {
+              console.error("❌ Fatal error in OpenAI connection setup:", error);
+            });
+          }
         }
       } else {
         // This is binary audio data (640 bytes of L16 PCM)
