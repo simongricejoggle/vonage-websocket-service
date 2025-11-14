@@ -229,6 +229,7 @@ wss.on("connection", async (vonageWS, request) => {
   let vonageStreamReady = false;
   let greetingSent = false;
   let welcomeGreeting = "Hi, this is Joggle answering for your business.";
+  let keepAliveInterval = null;
   
   // Interruption handling state
   let activeResponseId = null;
@@ -253,6 +254,13 @@ wss.on("connection", async (vonageWS, request) => {
     if (!openaiReady || !openaiWS || openaiWS.readyState !== WebSocket.OPEN) {
       console.log(`⏳ Waiting for OpenAI connection to be ready...`);
       return;
+    }
+    
+    // Stop keep-alive - OpenAI will now send real audio
+    if (keepAliveInterval) {
+      clearInterval(keepAliveInterval);
+      keepAliveInterval = null;
+      console.log(`🛑 Stopped keep-alive silence (OpenAI will send real audio now)`);
     }
     
     // All systems ready - send greeting!
@@ -590,6 +598,30 @@ wss.on("connection", async (vonageWS, request) => {
         
         if (msg.event === "websocket:connected") {
           console.log("📞 Vonage connected, content-type:", msg['content-type']);
+          
+          // CRITICAL: Send immediate silence AND start periodic keep-alive
+          // Vonage expects bidirectional audio immediately or it closes the connection
+          console.log("🔇 Starting keep-alive silence to Vonage (prevents premature disconnect)");
+          const silenceBuffer = Buffer.alloc(640, 0); // 20ms of silence (640 bytes = 320 samples @ 16kHz)
+          
+          // Send first silence immediately
+          if (vonageWS.readyState === WebSocket.OPEN) {
+            vonageWS.send(silenceBuffer);
+          }
+          
+          // Keep sending silence every 20ms until OpenAI is ready
+          keepAliveInterval = setInterval(() => {
+            if (vonageWS.readyState === WebSocket.OPEN && !openaiReady) {
+              vonageWS.send(silenceBuffer);
+            } else if (openaiReady || vonageWS.readyState !== WebSocket.OPEN) {
+              // Stop if OpenAI is ready or Vonage disconnected
+              if (keepAliveInterval) {
+                clearInterval(keepAliveInterval);
+                keepAliveInterval = null;
+              }
+            }
+          }, 20); // 20ms intervals (matching Vonage's audio packet rate)
+          
           // Mark Vonage as ready
           vonageStreamReady = true;
           
@@ -628,6 +660,20 @@ wss.on("connection", async (vonageWS, request) => {
 
   vonageWS.on("close", async () => {
     console.log("📞 Vonage connection closed");
+    
+    // Clean up keep-alive interval
+    if (keepAliveInterval) {
+      clearInterval(keepAliveInterval);
+      keepAliveInterval = null;
+      console.log("🛑 Cleaned up keep-alive interval");
+    }
+    
+    // Clean up cancel timeout
+    if (cancelTimeout) {
+      clearTimeout(cancelTimeout);
+      cancelTimeout = null;
+    }
+    
     if (openaiWS) openaiWS.close();
     
     // End call log and trigger summary
