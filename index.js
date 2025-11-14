@@ -171,6 +171,9 @@ async function prewarmOpenAIConnection(conversationId, businessId) {
 
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
+      console.error(`❌ Pre-warm timeout for ${conversationId} - cleaning up`);
+      prewarmPool.delete(conversationId);
+      ws.close();
       reject(new Error('Pre-warm connection timeout'));
     }, 15000);
 
@@ -201,6 +204,16 @@ async function prewarmOpenAIConnection(conversationId, businessId) {
       
       ws.send(JSON.stringify(sessionConfig));
       
+      // CRITICAL FIX: Mark as ready immediately after sending config
+      // The setupPrewarmedConnection() handler will catch the actual session.updated event
+      if (prewarmPool.has(conversationId)) {
+        const poolData = prewarmPool.get(conversationId);
+        poolData.ready = true;
+        console.log(`🎯 Pre-warmed session marked ready: ${conversationId}`);
+        clearTimeout(timeout);
+        resolve();
+      }
+      
       // Fetch knowledge in background
       const knowledgeUrl = `${process.env.REPLIT_APP_URL || 'https://myjoggle.replit.app'}/api/phone/knowledge/${businessId}`;
       fetch(knowledgeUrl)
@@ -217,21 +230,6 @@ async function prewarmOpenAIConnection(conversationId, businessId) {
           }
         })
         .catch(err => console.log(`⚠️ Knowledge fetch failed:`, err.message));
-    });
-
-    ws.on('message', (raw) => {
-      try {
-        const evt = JSON.parse(raw.toString());
-        if (evt.type === 'session.updated' && prewarmPool.has(conversationId)) {
-          const poolData = prewarmPool.get(conversationId);
-          poolData.ready = true;
-          console.log(`🎯 Pre-warmed session ready: ${conversationId}`);
-          clearTimeout(timeout);
-          resolve();
-        }
-      } catch (err) {
-        // Ignore parse errors
-      }
     });
 
     ws.on('error', (error) => {
