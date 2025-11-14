@@ -244,6 +244,7 @@ wss.on("connection", async (vonageWS, request) => {
   let audioQueue = [];  // Buffer for queued audio packets
   let pendingResponseCreate = false;  // Flag to defer response.create until cancel confirmed
   let cancelTimeout = null;  // Timeout to prevent deadlock
+  let earlyAudioBuffer = [];  // Buffer audio deltas that arrive before Vonage is ready
   
   // Helper function to send greeting when both systems are ready
   const trySendGreeting = () => {
@@ -661,7 +662,15 @@ wss.on("connection", async (vonageWS, request) => {
           
           // Only forward audio if AI is still speaking (not interrupted)
           if (isAiSpeaking) {
-            sendVonageAudio(evt.delta);
+            // CRITICAL FIX: Buffer audio if Vonage isn't ready yet
+            if (!vonageStreamReady) {
+              earlyAudioBuffer.push(evt.delta);
+              if (earlyAudioBuffer.length === 1) {
+                console.log("⏳ Buffering audio - Vonage not ready yet");
+              }
+            } else {
+              sendVonageAudio(evt.delta);
+            }
           }
         } else if (evt.type === "error") {
           // Ignore expected cancellation errors
@@ -707,31 +716,44 @@ wss.on("connection", async (vonageWS, request) => {
           
           // CRITICAL: Vonage expects audio at exactly 50 packets/second (one 640-byte packet every 20ms)
           // Sending packets too fast causes buffer overflow and disconnection
-          const silenceBuffer = Buffer.alloc(640, 0); // 20ms of silence (640 bytes = 320 samples @ 16kHz)
           
-          // Send first silence packet immediately (synchronous - no delay)
-          console.log("🔇 Starting silence keep-alive at proper rate (50 packets/second)...");
-          if (vonageWS.readyState === WebSocket.OPEN) {
-            vonageWS.send(silenceBuffer);
-          }
-          
-          // Start keep-alive interval IMMEDIATELY at correct pace (20ms = 50 packets/second)
-          // Keep running until FIRST real audio arrives from OpenAI (not just when openaiReady flag is set)
-          keepAliveInterval = setInterval(() => {
+          // CRITICAL FIX: Only start keep-alive if we haven't received real audio yet
+          if (!firstAudioReceived) {
+            const silenceBuffer = Buffer.alloc(640, 0); // 20ms of silence (640 bytes = 320 samples @ 16kHz)
+            
+            // Send first silence packet immediately (synchronous - no delay)
+            console.log("🔇 Starting silence keep-alive at proper rate (50 packets/second)...");
             if (vonageWS.readyState === WebSocket.OPEN) {
               vonageWS.send(silenceBuffer);
-            } else {
-              // Stop only if Vonage disconnected
-              if (keepAliveInterval) {
-                clearInterval(keepAliveInterval);
-                keepAliveInterval = null;
-                console.log("🛑 Stopped silence keep-alive (Vonage disconnected)");
-              }
             }
-          }, 20); // 20ms intervals = 50 packets/second (Vonage's expected audio rate)
+            
+            // Start keep-alive interval IMMEDIATELY at correct pace (20ms = 50 packets/second)
+            // Keep running until FIRST real audio arrives from OpenAI (not just when openaiReady flag is set)
+            keepAliveInterval = setInterval(() => {
+              if (vonageWS.readyState === WebSocket.OPEN) {
+                vonageWS.send(silenceBuffer);
+              } else {
+                // Stop only if Vonage disconnected
+                if (keepAliveInterval) {
+                  clearInterval(keepAliveInterval);
+                  keepAliveInterval = null;
+                  console.log("🛑 Stopped silence keep-alive (Vonage disconnected)");
+                }
+              }
+            }, 20); // 20ms intervals = 50 packets/second (Vonage's expected audio rate)
+          } else {
+            console.log("✅ Skipping keep-alive - real audio already received");
+          }
           
           // Mark Vonage as ready
           vonageStreamReady = true;
+          
+          // CRITICAL: Flush any buffered audio that arrived before Vonage was ready
+          if (earlyAudioBuffer.length > 0) {
+            console.log(`🎵 Flushing ${earlyAudioBuffer.length} buffered audio deltas to Vonage`);
+            earlyAudioBuffer.forEach(delta => sendVonageAudio(delta));
+            earlyAudioBuffer = [];
+          }
           
           // Start OpenAI connection in background (non-blocking)
           createOpenAIConnection().catch(error => {
