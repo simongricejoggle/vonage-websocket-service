@@ -226,6 +226,10 @@ wss.on("connection", async (vonageWS, request) => {
   
   let openaiWS = null;
   let openaiReady = false;
+  let vonageStreamReady = false;
+  let greetingSent = false;
+  let welcomeGreeting = "Hi, this is Joggle answering for your business.";
+  
   // Interruption handling state
   let activeResponseId = null;
   let activeItemId = null;  // Track current output item for truncation
@@ -233,6 +237,45 @@ wss.on("connection", async (vonageWS, request) => {
   let audioQueue = [];  // Buffer for queued audio packets
   let pendingResponseCreate = false;  // Flag to defer response.create until cancel confirmed
   let cancelTimeout = null;  // Timeout to prevent deadlock
+  
+  // Helper function to send greeting when both systems are ready
+  const trySendGreeting = () => {
+    if (greetingSent) {
+      console.log(`✅ Greeting already sent, skipping`);
+      return;
+    }
+    
+    if (!vonageStreamReady) {
+      console.log(`⏳ Waiting for Vonage stream to be ready...`);
+      return;
+    }
+    
+    if (!openaiReady || !openaiWS || openaiWS.readyState !== WebSocket.OPEN) {
+      console.log(`⏳ Waiting for OpenAI connection to be ready...`);
+      return;
+    }
+    
+    // All systems ready - send greeting!
+    console.log(`👋 Sending custom greeting (all systems ready)...`);
+    sendOpenAI({
+      type: "conversation.item.create",
+      item: {
+        type: "message",
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text: `[SYSTEM: This is the start of the call. Greet the caller by saying exactly: "${welcomeGreeting}" and then wait for them to respond.]`
+          }
+        ]
+      }
+    });
+    
+    // Trigger the greeting response
+    sendOpenAI({ type: "response.create" });
+    greetingSent = true;
+    console.log(`✅ Greeting sent successfully`);
+  };
   
   // Helper function to store conversation messages
   const storeMessage = async (role, content) => {
@@ -276,7 +319,7 @@ wss.on("connection", async (vonageWS, request) => {
     let voiceConfig = { voice: "alloy", speed: 1.0 };
     let voiceInstructions = "";
     let languagePrompt = "";
-    let welcomeGreeting = "Hi, this is Joggle answering for your business.";
+    // Don't redeclare welcomeGreeting - use the outer scope variable
     
     try {
       const knowledgeUrl = `${process.env.REPLIT_APP_URL || 'https://myjoggle.replit.app'}/api/phone/knowledge/${businessId}`;
@@ -290,6 +333,7 @@ wss.on("connection", async (vonageWS, request) => {
           voiceConfig = data.voiceConfig || { voice: "alloy", speed: 1.0 };
           voiceInstructions = data.voiceInstructions || "";
           languagePrompt = data.languagePrompt || "";
+          // Store welcome greeting in outer scope for trySendGreeting()
           welcomeGreeting = voiceConfig.welcomeGreeting || welcomeGreeting;
           console.log(`✅ Retrieved ${knowledge.length} chars of knowledge`);
           console.log(`🎙️ Voice config:`, voiceConfig);
@@ -376,24 +420,8 @@ wss.on("connection", async (vonageWS, request) => {
       console.log("✅ OpenAI session configured, ready for audio");
       console.log("📝 Full instructions length:", instructions.length);
       
-      // Add welcome greeting as user message, then ask AI to respond
-      console.log(`👋 Sending welcome prompt: "${welcomeGreeting}"`);
-      sendOpenAI({
-        type: "conversation.item.create",
-        item: {
-          type: "message",
-          role: "user",
-          content: [
-            {
-              type: "input_text",
-              text: `[SYSTEM: This is the start of the call. Greet the caller by saying exactly: "${welcomeGreeting}" and then wait for them to respond.]`
-            }
-          ]
-        }
-      });
-      
-      // Trigger the greeting response
-      sendOpenAI({ type: "response.create" });
+      // Try sending greeting if Vonage is already ready
+      trySendGreeting();
     });
 
     openaiWS.on("message", (raw) => {
@@ -562,8 +590,16 @@ wss.on("connection", async (vonageWS, request) => {
         
         if (msg.event === "websocket:connected") {
           console.log("📞 Vonage connected, content-type:", msg['content-type']);
-          // Start OpenAI connection immediately
-          await createOpenAIConnection();
+          // Mark Vonage as ready
+          vonageStreamReady = true;
+          
+          // Start OpenAI connection in background (non-blocking)
+          createOpenAIConnection().catch(error => {
+            console.error("❌ Fatal error in OpenAI connection setup:", error);
+          });
+          
+          // Try sending greeting (will wait for OpenAI if not ready yet)
+          trySendGreeting();
         }
       } else {
         // This is binary audio data (640 bytes of L16 PCM)
