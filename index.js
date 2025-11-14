@@ -226,6 +226,7 @@ wss.on("connection", async (vonageWS, request) => {
     console.warn('⚠️ Skipping call log creation - no tracking secret configured');
   }
   
+  // CRITICAL: Reset ALL state for each new call (prevent state leakage between calls)
   let openaiWS = null;
   let openaiReady = false;
   let vonageStreamReady = false;
@@ -246,8 +247,12 @@ wss.on("connection", async (vonageWS, request) => {
   let cancelTimeout = null;  // Timeout to prevent deadlock
   let earlyAudioBuffer = [];  // Buffer audio deltas that arrive before Vonage is ready
   
+  console.log("🔄 Call state initialized for conversation:", conversationId);
+  
   // Helper function to send greeting when both systems are ready
   const trySendGreeting = () => {
+    console.log(`🔍 trySendGreeting() called - greetingSent: ${greetingSent}, vonageReady: ${vonageStreamReady}, openaiReady: ${openaiReady}`);
+    
     if (greetingSent) {
       console.log(`✅ Greeting already sent, skipping`);
       return;
@@ -264,8 +269,7 @@ wss.on("connection", async (vonageWS, request) => {
     }
     
     // All systems ready - send greeting immediately!
-    // Keep-alive will continue until FIRST audio delta arrives
-    console.log(`👋 Sending greeting instruction to OpenAI...`);
+    console.log(`🎯 ALL SYSTEMS READY - Sending greeting NOW!`);
     
     // CRITICAL FIX: Use response.create with instructions to speak the greeting immediately
     // This avoids creating a user message that OpenAI would need to respond to
@@ -277,7 +281,7 @@ wss.on("connection", async (vonageWS, request) => {
     });
     
     greetingSent = true;
-    console.log(`✅ Greeting instruction sent - OpenAI will speak immediately`);
+    console.log(`✅ Greeting sent successfully`);
   };
   
   // Helper function to store conversation messages
@@ -712,10 +716,11 @@ wss.on("connection", async (vonageWS, request) => {
         console.log(`📋 Vonage event: ${msg.event}`);
         
         if (msg.event === "websocket:connected") {
-          console.log("📞 Vonage connected, content-type:", msg['content-type']);
+          console.log("📞 Vonage websocket:connected, content-type:", msg['content-type']);
+          console.log("⏳ Waiting for media bridge to fully establish (will mark ready on first audio packet)...");
           
-          // CRITICAL: Vonage expects audio at exactly 50 packets/second (one 640-byte packet every 20ms)
-          // Sending packets too fast causes buffer overflow and disconnection
+          // DON'T mark vonageStreamReady here - wait for first binary audio packet!
+          // The websocket:connected event fires BEFORE the media bridge is actually open
           
           // CRITICAL FIX: Only start keep-alive if we haven't received real audio yet
           if (!firstAudioReceived) {
@@ -745,33 +750,38 @@ wss.on("connection", async (vonageWS, request) => {
             console.log("✅ Skipping keep-alive - real audio already received");
           }
           
-          // Mark Vonage as ready
-          vonageStreamReady = true;
-          
-          // CRITICAL: Flush any buffered audio that arrived before Vonage was ready
-          if (earlyAudioBuffer.length > 0) {
-            console.log(`🎵 Flushing ${earlyAudioBuffer.length} buffered audio deltas to Vonage`);
-            earlyAudioBuffer.forEach(delta => sendVonageAudio(delta));
-            earlyAudioBuffer = [];
-          }
-          
           // Start OpenAI connection in background (non-blocking)
           createOpenAIConnection().catch(error => {
             console.error("❌ Fatal error in OpenAI connection setup:", error);
           });
-          
-          // Try sending greeting if OpenAI already ready (handles race condition)
-          trySendGreeting();
         }
       } else {
         // This is binary audio data (640 bytes of L16 PCM)
-        if (openaiReady && isBuffer && raw.length === 640) {
-          // Convert raw PCM buffer to base64 for OpenAI
-          const base64Audio = raw.toString('base64');
-          sendOpenAI({
-            type: "input_audio_buffer.append",
-            audio: base64Audio
-          });
+        if (isBuffer && raw.length === 640) {
+          // CRITICAL: First audio packet confirms media bridge is actually ready
+          if (!vonageStreamReady) {
+            vonageStreamReady = true;
+            console.log("✅ Vonage media bridge ready (first audio packet received)");
+            
+            // CRITICAL: Flush any buffered audio that arrived before Vonage was ready
+            if (earlyAudioBuffer.length > 0) {
+              console.log(`🎵 Flushing ${earlyAudioBuffer.length} buffered audio deltas to Vonage`);
+              earlyAudioBuffer.forEach(delta => sendVonageAudio(delta));
+              earlyAudioBuffer = [];
+            }
+            
+            // Now try sending greeting (OpenAI might already be ready)
+            trySendGreeting();
+          }
+          
+          // Forward audio to OpenAI if ready
+          if (openaiReady) {
+            const base64Audio = raw.toString('base64');
+            sendOpenAI({
+              type: "input_audio_buffer.append",
+              audio: base64Audio
+            });
+          }
         } else if (isBuffer && raw.length !== 640) {
           console.log(`⚠️ Unexpected audio buffer size: ${raw.length} bytes (expected 640)`);
         }
