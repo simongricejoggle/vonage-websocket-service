@@ -87,7 +87,7 @@ app.get('/test-openai', async (req, res) => {
 
   try {
     const WebSocket = require('ws');
-    const testWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01', {
+    const testWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-realtime', {
       headers: {
         'Authorization': `Bearer ${apiKey}`
       }
@@ -176,8 +176,8 @@ class PrewarmedSession {
       throw new Error('OPENAI_API_KEY not configured');
     }
 
-    // Create OpenAI WebSocket
-    this.ws = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01', {
+    // Create OpenAI WebSocket (GA model)
+    this.ws = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-realtime', {
       headers: {
         'Authorization': `Bearer ${apiKey}`
       }
