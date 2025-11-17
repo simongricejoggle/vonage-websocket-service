@@ -219,6 +219,7 @@ class PrewarmedSession {
       const sessionConfig = {
         type: "session.update",
         session: {
+          type: "realtime",
           modalities: ["text", "audio"],
           instructions: "You are a helpful voice assistant. CRITICAL: Always respond with BOTH text AND audio. Never send text-only responses. When requested to greet, immediately respond with spoken audio.",
           voice: "ash",
@@ -382,6 +383,7 @@ class PrewarmedSession {
     const sessionConfig = {
       type: "session.update",
       session: {
+        type: "realtime",
         modalities: ["text", "audio"],
         instructions: this.fullInstructions,
         voice: this.voiceConfig.voice || "ash",
