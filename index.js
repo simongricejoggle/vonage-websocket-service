@@ -215,17 +215,24 @@ class PrewarmedSession {
     this.ws.on('open', () => {
       console.log(`✅ OpenAI connected for session ${this.conversationId}`);
       
-      // Send session config - MATCHES WORKING VoiceChatHandler.tsx
+      // Send session config - GA API structure
       const sessionConfig = {
         type: "session.update",
         session: {
           type: "realtime",
-          turn_detection: {
-            type: "server_vad",
-            threshold: 0.5,
-            prefix_padding_ms: 200,
-            silence_duration_ms: 800,
-            create_response: false
+          audio: {
+            input: {
+              turn_detection: {
+                type: "server_vad",
+                threshold: 0.5,
+                prefix_padding_ms: 200,
+                silence_duration_ms: 800,
+                create_response: false
+              }
+            },
+            output: {
+              voice: "ash"
+            }
           }
         }
       };
