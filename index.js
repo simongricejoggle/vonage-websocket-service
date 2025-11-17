@@ -438,6 +438,7 @@ class PrewarmedSession {
     const greetingInstruction = {
       type: "response.create",
       response: {
+        modalities: ["audio"], // ✅ Explicitly request audio output
         instructions: `Say this exact greeting immediately: "${this.welcomeGreeting}"`
       }
     };
