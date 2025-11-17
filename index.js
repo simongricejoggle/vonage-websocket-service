@@ -246,14 +246,14 @@ class PrewarmedSession {
         // Log session.created (first event from OpenAI)
         if (evt.type === 'session.created') {
           console.log(`📝 Session created for ${this.conversationId}`);
-          this.ready = true; // Mark ready immediately on session.created
-          console.log(`🎯 Session ready: ${this.conversationId}`);
         }
         
-        // Also mark ready when session is updated
-        if (evt.type === 'session.updated' && !this.ready) {
-          this.ready = true;
-          console.log(`🎯 Session ready (updated): ${this.conversationId}`);
+        // Mark ready when session is updated (AFTER config is acknowledged)
+        if (evt.type === 'session.updated') {
+          if (!this.ready) {
+            this.ready = true;
+            console.log(`🎯 Session ready (updated): ${this.conversationId}`);
+          }
         }
         
         // Track response lifecycle
