@@ -89,8 +89,7 @@ app.get('/test-openai', async (req, res) => {
     const WebSocket = require('ws');
     const testWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01', {
       headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'OpenAI-Beta': 'realtime=v1'
+        'Authorization': `Bearer ${apiKey}`
       }
     });
 
@@ -180,8 +179,7 @@ class PrewarmedSession {
     // Create OpenAI WebSocket
     this.ws = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01', {
       headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'OpenAI-Beta': 'realtime=v1'
+        'Authorization': `Bearer ${apiKey}`
       }
     });
 
@@ -222,7 +220,7 @@ class PrewarmedSession {
         type: "session.update",
         session: {
           modalities: ["text", "audio"],
-          instructions: "You are a helpful assistant. Greet the caller immediately when requested.",
+          instructions: "You are a helpful voice assistant. CRITICAL: Always respond with BOTH text AND audio. Never send text-only responses. When requested to greet, immediately respond with spoken audio.",
           voice: "ash",
           input_audio_format: "pcm16",
           output_audio_format: "pcm16",
@@ -384,20 +382,17 @@ class PrewarmedSession {
     const sessionConfig = {
       type: "session.update",
       session: {
-        type: "realtime",
-        model: "gpt-realtime",
+        modalities: ["text", "audio"],
         instructions: this.fullInstructions,
-        audio: {
-          input: {
-            turn_detection: {
-              type: "server_vad",
-              threshold: 0.5,
-              prefix_padding_ms: 200,
-              silence_duration_ms: 800,
-              create_response: false
-            }
-          },
-          output: { voice: this.voiceConfig.voice || "ash" }
+        voice: this.voiceConfig.voice || "ash",
+        input_audio_format: "pcm16",
+        output_audio_format: "pcm16",
+        turn_detection: {
+          type: "server_vad",
+          threshold: 0.5,
+          prefix_padding_ms: 200,
+          silence_duration_ms: 800,
+          create_response: false
         }
       }
     };
