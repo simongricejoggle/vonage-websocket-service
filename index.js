@@ -51,7 +51,8 @@ app.get('/health', (req, res) => {
 
 // Pre-warm endpoint - called by Replit server when NCCO is generated
 app.post('/prewarm', express.json(), async (req, res) => {
-  const { conversationId, businessId } = req.body;
+  const { conversationId: rawConvId, businessId } = req.body;
+  const conversationId = rawConvId?.toLowerCase(); // Normalize to lowercase
   
   if (!conversationId || !businessId) {
     return res.status(400).json({ 
@@ -516,7 +517,7 @@ wss.on("connection", async (vonageWS, request) => {
   
   const url = new URL(request.url || '', `http://${request.headers.host}`);
   const businessId = url.searchParams.get('business_id') || url.searchParams.get('assistant_id') || "default";
-  const conversationId = url.searchParams.get('conversation_id') || "unknown";
+  const conversationId = (url.searchParams.get('conversation_id') || "unknown").toLowerCase(); // Normalize to lowercase
   const fromNumber = url.searchParams.get('from') || "unknown";
   const toNumber = url.searchParams.get('to') || "unknown";
   
