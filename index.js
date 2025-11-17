@@ -459,7 +459,7 @@ class PrewarmedSession {
     const responseRequest = {
       type: "response.create",
       response: {
-        modalities: ["audio"]
+        modalities: ["audio", "text"]
       }
     };
     
