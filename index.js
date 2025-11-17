@@ -215,25 +215,23 @@ class PrewarmedSession {
     this.ws.on('open', () => {
       console.log(`✅ OpenAI connected for session ${this.conversationId}`);
       
-      // Send session config - GA API structure
+      // Send session config - Official GA API structure
       const sessionConfig = {
         type: "session.update",
         session: {
-          type: "realtime",
-          audio: {
-            input: {
-              turn_detection: {
-                type: "server_vad",
-                threshold: 0.5,
-                prefix_padding_ms: 200,
-                silence_duration_ms: 800,
-                create_response: false
-              }
-            },
-            output: {
-              voice: "ash"
-            }
-          }
+          modalities: ["text", "audio"],
+          instructions: "You are a helpful assistant.",
+          voice: "ash",
+          input_audio_format: "pcm16",
+          output_audio_format: "pcm16",
+          turn_detection: {
+            type: "server_vad",
+            threshold: 0.5,
+            prefix_padding_ms: 300,
+            silence_duration_ms: 700,
+            create_response: true
+          },
+          temperature: 0.8
         }
       };
       
@@ -382,11 +380,10 @@ class PrewarmedSession {
   applyFullKnowledge() {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     
-    // Update session with full instructions only (no model/audio config)
+    // Update session with full instructions only
     const sessionConfig = {
       type: "session.update",
       session: {
-        type: "realtime",
         instructions: this.fullInstructions
       }
     };
@@ -445,11 +442,9 @@ class PrewarmedSession {
     };
     
     // Step 2: Request audio response
+    // Note: modalities is set at session level, not here
     const responseRequest = {
-      type: "response.create",
-      response: {
-        modalities: ["audio", "text"]
-      }
+      type: "response.create"
     };
     
     // Send both commands
