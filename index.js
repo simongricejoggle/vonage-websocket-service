@@ -215,20 +215,10 @@ class PrewarmedSession {
     this.ws.on('open', () => {
       console.log(`✅ OpenAI connected for session ${this.conversationId}`);
       
-      // Send minimal session config (GA Realtime API format)
+      // Send session config - MATCHES WORKING VoiceChatHandler.tsx
       const sessionConfig = {
         type: "session.update",
         session: {
-          type: "realtime",
-          model: "gpt-realtime",
-          instructions: "You are a helpful voice assistant. CRITICAL: Always respond with BOTH text AND audio. Never send text-only responses. When requested to greet, immediately respond with spoken audio.",
-          audio: {
-            input: { format: "pcm16" },
-            output: { 
-              voice: "ash",
-              format: "pcm16"
-            }
-          },
           turn_detection: {
             type: "server_vad",
             threshold: 0.5,
@@ -384,26 +374,11 @@ class PrewarmedSession {
   applyFullKnowledge() {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     
+    // Update session with full instructions only (no model/audio config)
     const sessionConfig = {
       type: "session.update",
       session: {
-        type: "realtime",
-        model: "gpt-realtime",
-        instructions: this.fullInstructions,
-        audio: {
-          input: { format: "pcm16" },
-          output: { 
-            voice: this.voiceConfig.voice || "ash",
-            format: "pcm16"
-          }
-        },
-        turn_detection: {
-          type: "server_vad",
-          threshold: 0.5,
-          prefix_padding_ms: 200,
-          silence_duration_ms: 800,
-          create_response: false
-        }
+        instructions: this.fullInstructions
       }
     };
     
