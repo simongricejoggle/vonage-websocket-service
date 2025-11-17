@@ -219,6 +219,7 @@ class PrewarmedSession {
       const sessionConfig = {
         type: "session.update",
         session: {
+          type: "realtime",
           turn_detection: {
             type: "server_vad",
             threshold: 0.5,
@@ -378,6 +379,7 @@ class PrewarmedSession {
     const sessionConfig = {
       type: "session.update",
       session: {
+        type: "realtime",
         instructions: this.fullInstructions
       }
     };
