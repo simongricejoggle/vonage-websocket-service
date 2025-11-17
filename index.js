@@ -176,9 +176,6 @@ class PrewarmedSession {
       throw new Error('OPENAI_API_KEY not configured');
     }
 
-    // Fetch knowledge FIRST (in parallel with WebSocket connection)
-    const knowledgePromise = this.fetchKnowledge();
-
     // Create OpenAI WebSocket
     this.ws = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01', {
       headers: {
@@ -190,24 +187,27 @@ class PrewarmedSession {
     // Set up event handlers
     this.setupEventHandlers();
 
-    // Wait for BOTH session ready AND knowledge loaded
-    await Promise.all([
-      this.waitForReady(),
-      knowledgePromise
-    ]);
+    // Wait ONLY for session ready (fast - just WebSocket connection)
+    await this.waitForReady();
+    console.log(`✅ Session ${this.conversationId} ready (OpenAI connected)`);
     
-    console.log(`✅ Session ${this.conversationId} fully initialized with knowledge`);
-    
-    // 🚀 CRITICAL: Apply full knowledge (including voice config) BEFORE sending greeting
-    if (this.fullInstructions) {
-      this.applyFullKnowledge();
-      // Wait a moment for session update to apply
-      await new Promise(resolve => setTimeout(resolve, 100));
-    }
-    
-    // Send greeting with correct voice and config
-    console.log(`🎤 Triggering greeting with business-specific config...`);
+    // 🚀 CRITICAL: Send greeting IMMEDIATELY with default config
+    // This starts buffering audio RIGHT NOW (2-3s before Vonage connects)
+    console.log(`🎤 Sending immediate greeting to start buffering...`);
     this.sendGreeting();
+    
+    // Fetch knowledge in background and update session after greeting
+    this.fetchKnowledge().then(() => {
+      console.log(`📚 Knowledge loaded for ${this.conversationId} - will apply after greeting`);
+      
+      // Apply full knowledge AFTER greeting completes (for subsequent responses)
+      // Don't interrupt the greeting that's already playing
+      if (this.fullInstructions && this.greetingComplete) {
+        this.applyFullKnowledge();
+      }
+    }).catch(err => {
+      console.error(`❌ Knowledge fetch failed for ${this.conversationId}:`, err.message);
+    });
     
     return this;
   }
