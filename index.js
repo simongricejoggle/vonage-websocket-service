@@ -301,6 +301,11 @@ class PrewarmedSession {
           }
         }
         
+        // Log any errors from OpenAI
+        if (evt.type === 'error') {
+          console.error(`❌ OpenAI error in ${this.conversationId}:`, JSON.stringify(evt.error));
+        }
+        
       } catch (err) {
         // Ignore parse errors
       }
@@ -435,15 +440,32 @@ class PrewarmedSession {
       return false;
     }
     
-    const greetingInstruction = {
-      type: "response.create",
-      response: {
-        modalities: ["audio"], // ✅ Explicitly request audio output
-        instructions: `Say this exact greeting immediately: "${this.welcomeGreeting}"`
+    // Step 1: Create conversation item with greeting text
+    const greetingItem = {
+      type: "conversation.item.create",
+      item: {
+        type: "message",
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text: this.welcomeGreeting
+          }
+        ]
       }
     };
     
-    this.ws.send(JSON.stringify(greetingInstruction));
+    // Step 2: Request audio response
+    const responseRequest = {
+      type: "response.create",
+      response: {
+        modalities: ["audio"]
+      }
+    };
+    
+    // Send both commands
+    this.ws.send(JSON.stringify(greetingItem));
+    this.ws.send(JSON.stringify(responseRequest));
     console.log(`👋 Greeting sent in session ${this.conversationId}`);
     return true;
   }
