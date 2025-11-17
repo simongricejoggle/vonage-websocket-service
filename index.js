@@ -217,24 +217,21 @@ class PrewarmedSession {
     this.ws.on('open', () => {
       console.log(`✅ OpenAI connected for session ${this.conversationId}`);
       
-      // Send minimal session config
+      // Send minimal session config (correct Realtime API format)
       const sessionConfig = {
         type: "session.update",
         session: {
-          type: "realtime",
-          model: "gpt-realtime",
+          modalities: ["text", "audio"],
           instructions: "You are a helpful assistant. Greet the caller immediately when requested.",
-          audio: {
-            input: {
-              turn_detection: {
-                type: "server_vad",
-                threshold: 0.5,
-                prefix_padding_ms: 200,
-                silence_duration_ms: 800,
-                create_response: false
-              }
-            },
-            output: { voice: "ash" }
+          voice: "ash",
+          input_audio_format: "pcm16",
+          output_audio_format: "pcm16",
+          turn_detection: {
+            type: "server_vad",
+            threshold: 0.5,
+            prefix_padding_ms: 200,
+            silence_duration_ms: 800,
+            create_response: false
           }
         }
       };
@@ -246,11 +243,17 @@ class PrewarmedSession {
       try {
         const evt = JSON.parse(raw.toString());
         
-        // Mark ready when session is updated
+        // Log session.created (first event from OpenAI)
+        if (evt.type === 'session.created') {
+          console.log(`📝 Session created for ${this.conversationId}`);
+          this.ready = true; // Mark ready immediately on session.created
+          console.log(`🎯 Session ready: ${this.conversationId}`);
+        }
+        
+        // Also mark ready when session is updated
         if (evt.type === 'session.updated' && !this.ready) {
           this.ready = true;
-          console.log(`🎯 Session ready: ${this.conversationId}`);
-          // Note: Greeting will be triggered after knowledge loads (in initialize())
+          console.log(`🎯 Session ready (updated): ${this.conversationId}`);
         }
         
         // Track response lifecycle
