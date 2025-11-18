@@ -10,7 +10,7 @@ const PORT = process.env.PORT || 8080;
 
 // Resample PCM16 audio from 24kHz to 16kHz
 function resample24to16(buffer24k) {
-  // Convert buffer to Int16Array
+  // Convert buffer to Int16Array (Node.js uses little-endian by default, which is correct for PCM16)
   const samples24k = new Int16Array(buffer24k.buffer, buffer24k.byteOffset, buffer24k.length / 2);
   const ratio = 24000 / 16000; // 1.5
   const outputLength = Math.floor(samples24k.length / ratio);
@@ -30,7 +30,8 @@ function resample24to16(buffer24k) {
     );
   }
   
-  return Buffer.from(samples16k.buffer);
+  // Return as Buffer (preserves little-endian byte order)
+  return Buffer.from(samples16k.buffer, samples16k.byteOffset, samples16k.byteLength);
 }
 
 const server = app.listen(PORT, '0.0.0.0', () => {
@@ -773,37 +774,34 @@ wss.on("connection", async (vonageWS, request) => {
           }, 20);
           
           // Acquire session AND attach immediately (websocket:connected = media bridge ready)
-          // Give Vonage a tick to complete handshake before we start sending audio
-          setImmediate(() => {
-            if (prewarmPool.has(conversationId)) {
-              // FAST PATH: Pre-warmed session (synchronous)
-              const poolData = prewarmPool.get(conversationId);
-              prewarmPool.delete(conversationId);
-              currentSession = poolData.session;
-              console.log(`🎯 Using pre-warmed session for ${conversationId}`);
-              console.log(`✅ Session acquired and ready for ${conversationId}`);
-              
-              // Attach immediately and start playing greeting
-              console.log("🎬 Attaching session and starting audio playback...");
-              currentSession.attachToVonage(sendVonageAudio, onFirstAudio, startQueueProcessor);
-            } else {
-              // SLOW PATH: Create new session (async)
-              console.log(`⚠️ No pre-warmed session - creating new session for ${conversationId}`);
-              (async () => {
-                try {
-                  const session = new PrewarmedSession(conversationId, businessId);
-                  await session.initialize();
-                  currentSession = session;
-                  console.log(`✅ New session ready for ${conversationId}`);
-                  
-                  // Attach once ready
-                  currentSession.attachToVonage(sendVonageAudio, onFirstAudio, startQueueProcessor);
-                } catch (error) {
-                  console.error(`❌ Failed to create session: ${error.message}`);
-                }
-              })();
-            }
-          });
+          if (prewarmPool.has(conversationId)) {
+            // FAST PATH: Pre-warmed session (synchronous)
+            const poolData = prewarmPool.get(conversationId);
+            prewarmPool.delete(conversationId);
+            currentSession = poolData.session;
+            console.log(`🎯 Using pre-warmed session for ${conversationId}`);
+            console.log(`✅ Session acquired and ready for ${conversationId}`);
+            
+            // Attach immediately and start playing greeting
+            console.log("🎬 Attaching session and starting audio playback...");
+            currentSession.attachToVonage(sendVonageAudio, onFirstAudio, startQueueProcessor);
+          } else {
+            // SLOW PATH: Create new session (async)
+            console.log(`⚠️ No pre-warmed session - creating new session for ${conversationId}`);
+            (async () => {
+              try {
+                const session = new PrewarmedSession(conversationId, businessId);
+                await session.initialize();
+                currentSession = session;
+                console.log(`✅ New session ready for ${conversationId}`);
+                
+                // Attach once ready
+                currentSession.attachToVonage(sendVonageAudio, onFirstAudio, startQueueProcessor);
+              } catch (error) {
+                console.error(`❌ Failed to create session: ${error.message}`);
+              }
+            })();
+          }
         }
       } else {
         // This is binary audio data (640 bytes of L16 PCM)
