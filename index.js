@@ -655,6 +655,12 @@ wss.on("connection", async (vonageWS, request) => {
           const silenceBuffer = Buffer.alloc(640, 0);
           console.log("🔇 Starting smart keep-alive...");
           
+          // Send initial silence packet immediately
+          if (vonageWS.readyState === WebSocket.OPEN) {
+            vonageWS.send(silenceBuffer);
+            lastAudioSent = Date.now();
+          }
+          
           keepAliveInterval = setInterval(() => {
             if (vonageWS.readyState === WebSocket.OPEN) {
               const timeSinceLastAudio = Date.now() - lastAudioSent;
