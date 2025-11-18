@@ -769,7 +769,6 @@ wss.on("connection", async (vonageWS, request) => {
   vonageWS.on("close", async (code, reason) => {
     console.log(`📞 Vonage connection closed - Code: ${code}, Reason: ${reason || 'none'}`);
     console.log(`🔍 DEBUG: Close triggered after ${audioPacketCount} packets sent`);
-    console.log(`🔍 DEBUG: ${audioQueue.length} packets still in queue`);
     
     // Clean up keep-alive interval
     if (keepAliveInterval) {
