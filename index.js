@@ -672,18 +672,32 @@ wss.on("connection", async (vonageWS, request) => {
             }
           }, 20);
           
-          // Acquire session (pre-warmed or new)
-          acquireSession()
-            .then(session => {
-              currentSession = session;
-              console.log(`✅ Session acquired and ready for ${conversationId}`);
-              
-              // Attach Vonage to session (greeting already sent/buffered)
-              session.attachToVonage(sendVonageAudio, onFirstAudio);
-            })
-            .catch(error => {
-              console.error(`❌ Failed to acquire session: ${error.message}`);
-            });
+          // Acquire session - synchronous for pre-warmed, async for new
+          if (prewarmPool.has(conversationId)) {
+            // FAST PATH: Pre-warmed session (synchronous)
+            const poolData = prewarmPool.get(conversationId);
+            prewarmPool.delete(conversationId);
+            currentSession = poolData.session;
+            console.log(`🎯 Using pre-warmed session for ${conversationId}`);
+            console.log(`✅ Session acquired and ready for ${conversationId}`);
+            
+            // Attach immediately
+            currentSession.attachToVonage(sendVonageAudio, onFirstAudio);
+          } else {
+            // SLOW PATH: Create new session (async)
+            console.log(`⚠️ No pre-warmed session - creating new session for ${conversationId}`);
+            (async () => {
+              try {
+                const session = new PrewarmedSession(conversationId, businessId);
+                await session.initialize();
+                currentSession = session;
+                console.log(`✅ New session ready for ${conversationId}`);
+                currentSession.attachToVonage(sendVonageAudio, onFirstAudio);
+              } catch (error) {
+                console.error(`❌ Failed to create session: ${error.message}`);
+              }
+            })();
+          }
         }
       } else {
         // This is binary audio data (640 bytes of L16 PCM)
