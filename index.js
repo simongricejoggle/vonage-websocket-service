@@ -87,10 +87,12 @@ app.get('/test-openai', async (req, res) => {
 
   try {
     const WebSocket = require('ws');
-    const testWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-realtime', {
+    const testWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-realtime-2025-08-28', {
       headers: {
-        'Authorization': `Bearer ${apiKey}`
-      }
+        'Authorization': `Bearer ${apiKey}`,
+        'OpenAI-Beta': 'realtime=v1'
+      },
+      protocol: 'realtime'
     });
 
     const timeout = setTimeout(() => {
@@ -176,11 +178,13 @@ class PrewarmedSession {
       throw new Error('OPENAI_API_KEY not configured');
     }
 
-    // Create OpenAI WebSocket (GA model)
-    this.ws = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-realtime', {
+    // Create OpenAI WebSocket with beta protocol
+    this.ws = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-realtime-2025-08-28', {
       headers: {
-        'Authorization': `Bearer ${apiKey}`
-      }
+        'Authorization': `Bearer ${apiKey}`,
+        'OpenAI-Beta': 'realtime=v1'
+      },
+      protocol: 'realtime'
     });
 
     // Set up event handlers
@@ -215,7 +219,7 @@ class PrewarmedSession {
     this.ws.on('open', () => {
       console.log(`✅ OpenAI connected for session ${this.conversationId}`);
       
-      // Send session config - Official GA API structure
+      // Send initial session config - beta partial update
       const sessionConfig = {
         type: "session.update",
         session: {
@@ -234,7 +238,6 @@ class PrewarmedSession {
           temperature: 0.8
         }
       };
-      
       this.ws.send(JSON.stringify(sessionConfig));
     });
 
@@ -380,14 +383,13 @@ class PrewarmedSession {
   applyFullKnowledge() {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     
-    // Update session with full instructions only
+    // Update session with full knowledge - beta partial update
     const sessionConfig = {
       type: "session.update",
       session: {
         instructions: this.fullInstructions
       }
     };
-    
     this.ws.send(JSON.stringify(sessionConfig));
     console.log(`✅ Applied full knowledge to session ${this.conversationId}`);
   }
@@ -426,30 +428,16 @@ class PrewarmedSession {
       return false;
     }
     
-    // Step 1: Create conversation item with greeting text
-    const greetingItem = {
-      type: "conversation.item.create",
-      item: {
-        type: "message",
-        role: "user",
-        content: [
-          {
-            type: "input_text",
-            text: this.welcomeGreeting
-          }
-        ]
+    // Beta API: modalities INSIDE response object
+    const triggerGreeting = {
+      type: "response.create",
+      response: {
+        modalities: ["audio", "text"],  // Inside response for beta
+        instructions: `Say: "${this.welcomeGreeting}"`
       }
     };
     
-    // Step 2: Request audio response
-    // Note: modalities is set at session level, not here
-    const responseRequest = {
-      type: "response.create"
-    };
-    
-    // Send both commands
-    this.ws.send(JSON.stringify(greetingItem));
-    this.ws.send(JSON.stringify(responseRequest));
+    this.ws.send(JSON.stringify(triggerGreeting));
     console.log(`👋 Greeting sent in session ${this.conversationId}`);
     return true;
   }
