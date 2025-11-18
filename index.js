@@ -626,21 +626,55 @@ wss.on("connection", async (vonageWS, request) => {
   
   // Function to start the queue processor (called AFTER buffered audio is queued)
   const startQueueProcessor = () => {
-    if (queueProcessor) return; // Already running
+    if (queueProcessor) {
+      console.log("⚠️ Queue processor already running");
+      return; // Already running
+    }
     
+    console.log(`🔍 DEBUG: keepAliveInterval exists? ${!!keepAliveInterval}`);
+    console.log(`🔍 DEBUG: audioQueue.length = ${audioQueue.length}`);
+    console.log(`🔍 DEBUG: vonageWS.readyState = ${vonageWS.readyState}`);
+    
+    // Stop keep-alive since queue processor will handle it
+    if (keepAliveInterval) {
+      clearInterval(keepAliveInterval);
+      keepAliveInterval = null;
+      console.log("🛑 Stopped keep-alive (queue processor will handle silence)");
+    } else {
+      console.log("⚠️ No keep-alive interval to stop");
+    }
+    
+    const silenceBuffer = Buffer.alloc(640, 0);
     console.log(`🎬 Starting audio queue processor (50 packets/sec, ${audioQueue.length} packets queued)`);
+    
     queueProcessor = setInterval(() => {
-      if (audioQueue.length > 0 && vonageWS.readyState === WebSocket.OPEN) {
-        const chunk = audioQueue.shift();
-        vonageWS.send(chunk);
-        lastAudioSent = Date.now();
-        audioPacketCount++;
-        
-        if (audioPacketCount === 1 || audioPacketCount % 50 === 0) {
-          console.log(`📤 Sent audio packet #${audioPacketCount} to Vonage (${audioQueue.length} queued)`);
+      try {
+        if (vonageWS.readyState !== WebSocket.OPEN) {
+          console.log(`⚠️ WebSocket not open (state: ${vonageWS.readyState})`);
+          return;
         }
+        
+        if (audioQueue.length > 0) {
+          // Send audio from queue
+          const chunk = audioQueue.shift();
+          vonageWS.send(chunk);
+          lastAudioSent = Date.now();
+          audioPacketCount++;
+          
+          if (audioPacketCount === 1 || audioPacketCount % 50 === 0 || audioPacketCount <= 5) {
+            console.log(`📤 Sent audio packet #${audioPacketCount} to Vonage (${audioQueue.length} queued)`);
+          }
+        } else {
+          // Queue empty - send silence to keep connection alive
+          vonageWS.send(silenceBuffer);
+          lastAudioSent = Date.now();
+        }
+      } catch (error) {
+        console.error(`❌ Error in queue processor: ${error.message}`);
       }
     }, 20); // Send 1 packet every 20ms (50 packets/second)
+    
+    console.log(`✅ Queue processor interval created: ${!!queueProcessor}`);
   };
   
   // Callback when first audio arrives (just track, don't stop keep-alive)
