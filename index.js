@@ -639,6 +639,12 @@ wss.on("connection", async (vonageWS, request) => {
       // Try to parse as JSON first
       const rawString = raw.toString();
       
+      // Debug: Log first message received
+      if (!firstAudioReceived && !vonageStreamReady) {
+        console.log(`🔍 First Vonage message type: ${typeof raw}, isBuffer: ${isBuffer}, length: ${raw.length}`);
+        console.log(`🔍 First 100 chars: ${rawString.substring(0, 100)}`);
+      }
+      
       // If it starts with {, it's a JSON control message
       if (rawString[0] === '{') {
         const msg = JSON.parse(rawString);
