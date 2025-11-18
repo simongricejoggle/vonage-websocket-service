@@ -690,7 +690,7 @@ wss.on("connection", async (vonageWS, request) => {
             }
           }, 20);
           
-          // Acquire session - synchronous for pre-warmed, async for new
+          // Acquire session AND attach immediately (websocket:connected = media bridge ready)
           if (prewarmPool.has(conversationId)) {
             // FAST PATH: Pre-warmed session (synchronous)
             const poolData = prewarmPool.get(conversationId);
@@ -699,7 +699,8 @@ wss.on("connection", async (vonageWS, request) => {
             console.log(`🎯 Using pre-warmed session for ${conversationId}`);
             console.log(`✅ Session acquired and ready for ${conversationId}`);
             
-            // Attach immediately
+            // Attach immediately and start playing greeting
+            console.log("🎬 Attaching session and starting audio playback...");
             currentSession.attachToVonage(sendVonageAudio, onFirstAudio);
           } else {
             // SLOW PATH: Create new session (async)
@@ -710,6 +711,8 @@ wss.on("connection", async (vonageWS, request) => {
                 await session.initialize();
                 currentSession = session;
                 console.log(`✅ New session ready for ${conversationId}`);
+                
+                // Attach once ready
                 currentSession.attachToVonage(sendVonageAudio, onFirstAudio);
               } catch (error) {
                 console.error(`❌ Failed to create session: ${error.message}`);
@@ -720,10 +723,10 @@ wss.on("connection", async (vonageWS, request) => {
       } else {
         // This is binary audio data (640 bytes of L16 PCM)
         if (isBuffer && raw.length === 640) {
-          // First audio packet confirms media bridge is ready
+          // First audio packet FROM user
           if (!vonageStreamReady) {
             vonageStreamReady = true;
-            console.log("✅ Vonage media bridge ready (first audio packet)");
+            console.log("✅ Vonage receiving audio from user (first packet)");
           }
           
           // Forward audio to session
