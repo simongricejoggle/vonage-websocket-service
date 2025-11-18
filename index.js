@@ -272,7 +272,8 @@ class PrewarmedSession {
         }
         
         // CRITICAL: Buffer audio deltas until Vonage attaches
-        if (evt.type === 'response.output_audio.delta' && evt.delta) {
+        // Beta API uses 'response.audio.delta' (not 'response.output_audio.delta')
+        if (evt.type === 'response.audio.delta' && evt.delta) {
           if (this.attached && this.sendToVonage) {
             // Directly forward to Vonage
             this.sendToVonage(evt.delta);
