@@ -398,7 +398,7 @@ class PrewarmedSession {
   }
 
   // Attach to Vonage call - provide callback to send audio
-  attachToVonage(sendAudioCallback, onFirstAudioCallback = null, startQueueProcessor = null) {
+  attachToVonage(sendAudioCallback, onFirstAudioCallback = null) {
     if (this.attached) {
       console.warn(`⚠️ Session ${this.conversationId} already attached`);
       return;
@@ -409,7 +409,7 @@ class PrewarmedSession {
     this.onFirstAudio = onFirstAudioCallback;
     console.log(`🔌 Vonage attached to session ${this.conversationId}`);
     
-    // Flush buffered audio
+    // Flush buffered audio - sends immediately to Vonage
     if (this.audioBuffer.length > 0) {
       console.log(`🎵 Flushing ${this.audioBuffer.length} buffered audio deltas to Vonage`);
       this.audioBuffer.forEach(delta => {
@@ -421,11 +421,6 @@ class PrewarmedSession {
         }
       });
       this.audioBuffer = [];
-      
-      // Start queue processor AFTER flushing buffered audio
-      if (startQueueProcessor) {
-        startQueueProcessor();
-      }
     }
   }
 
@@ -595,10 +590,8 @@ wss.on("connection", async (vonageWS, request) => {
     return session;
   }
   
-  // Helper function to send audio to Vonage with proper pacing
+  // Simple: Send audio to Vonage immediately, no queuing
   let audioPacketCount = 0;
-  const audioQueue = [];
-  let queueProcessor = null;
   let leftoverBytes = Buffer.alloc(0); // Accumulate partial chunks
   
   const sendVonageAudio = (base64Audio) => {
@@ -612,12 +605,25 @@ wss.on("connection", async (vonageWS, request) => {
     const combined = Buffer.concat([leftoverBytes, audioBuffer16k]);
     
     // Vonage expects EXACTLY 640 bytes per packet (20ms of 16kHz PCM16)
-    // Split the combined buffer into 640-byte chunks
+    // Split and send immediately - no queue
     const PACKET_SIZE = 640;
     let offset = 0;
     while (offset + PACKET_SIZE <= combined.length) {
       const chunk = combined.slice(offset, offset + PACKET_SIZE);
-      audioQueue.push(chunk);
+      
+      // Send immediately to Vonage
+      try {
+        vonageWS.send(chunk);
+        audioPacketCount++;
+        lastAudioSent = Date.now();
+        
+        if (audioPacketCount <= 3 || audioPacketCount % 100 === 0) {
+          console.log(`📤 Sent audio packet #${audioPacketCount} to Vonage`);
+        }
+      } catch (error) {
+        console.error(`❌ Error sending audio: ${error.message}`);
+      }
+      
       offset += PACKET_SIZE;
     }
     
@@ -625,86 +631,11 @@ wss.on("connection", async (vonageWS, request) => {
     leftoverBytes = combined.slice(offset);
   };
   
-  // Function to start the queue processor (called AFTER buffered audio is queued)
-  const startQueueProcessor = () => {
-    if (queueProcessor) {
-      console.log("⚠️ Queue processor already running");
-      return; // Already running
-    }
-    
-    console.log(`🔍 DEBUG: audioQueue.length = ${audioQueue.length}`);
-    console.log(`🔍 DEBUG: vonageWS.readyState = ${vonageWS.readyState} (1=OPEN, 2=CLOSING, 3=CLOSED)`);
-    
-    const silenceBuffer = Buffer.alloc(640, 0);
-    console.log(`🎬 Starting unified audio sender (50 packets/sec, ${audioQueue.length} packets queued)`);
-    
-    // Send FIRST packet IMMEDIATELY to prevent gap in audio stream
-    console.log(`🔍 DEBUG: About to send immediate packet, WS state = ${vonageWS.readyState}, queue = ${audioQueue.length}`);
-    if (vonageWS.readyState === WebSocket.OPEN) {
-      console.log(`🔍 DEBUG: Inside immediate send block`);
-      if (audioQueue.length > 0) {
-        console.log(`🔍 DEBUG: Sending audio packet immediately`);
-        const chunk = audioQueue.shift();
-        try {
-          vonageWS.send(chunk);
-          lastAudioSent = Date.now();
-          audioPacketCount++;
-          console.log(`📤 Sent IMMEDIATE audio packet #${audioPacketCount} to Vonage (${audioQueue.length} queued)`);
-        } catch (error) {
-          console.error(`❌ Error sending immediate packet: ${error.message}`);
-        }
-      } else {
-        console.log(`🔍 DEBUG: Sending silence immediately`);
-        vonageWS.send(silenceBuffer);
-        lastAudioSent = Date.now();
-        console.log(`🔇 Sent immediate silence packet`);
-      }
-    } else {
-      console.log(`🔍 DEBUG: WebSocket not OPEN, cannot send immediate packet`);
-    }
-    
-    // Now start the interval for subsequent packets
-    queueProcessor = setInterval(() => {
-      try {
-        if (vonageWS.readyState !== WebSocket.OPEN) {
-          return; // Silently skip when not open
-        }
-        
-        if (audioQueue.length > 0) {
-          // Send audio from queue
-          const chunk = audioQueue.shift();
-          vonageWS.send(chunk);
-          lastAudioSent = Date.now();
-          audioPacketCount++;
-          
-          if (audioPacketCount % 50 === 0 || audioPacketCount <= 5) {
-            console.log(`📤 Sent audio packet #${audioPacketCount} to Vonage (${audioQueue.length} queued)`);
-          }
-        } else {
-          // Queue empty - send silence to keep connection alive
-          vonageWS.send(silenceBuffer);
-          lastAudioSent = Date.now();
-        }
-      } catch (error) {
-        console.error(`❌ Error in audio sender: ${error.message}`);
-      }
-    }, 20); // Send 1 packet every 20ms (50 packets/second)
-    
-    // NOW stop the keep-alive, after the new sender is running and first packet sent
-    if (keepAliveInterval) {
-      clearInterval(keepAliveInterval);
-      keepAliveInterval = null;
-      console.log("🛑 Stopped separate keep-alive (unified sender now handles it)");
-    }
-    
-    console.log(`✅ Unified audio sender started successfully`);
-  };
-  
-  // Callback when first audio arrives (just track, don't stop keep-alive)
+  // Callback when first audio arrives
   const onFirstAudio = () => {
     if (!firstAudioReceived) {
       firstAudioReceived = true;
-      console.log("🎵 First audio from OpenAI (keep-alive continues)");
+      console.log("🎵 First audio from OpenAI received");
     }
   };
   
@@ -784,7 +715,7 @@ wss.on("connection", async (vonageWS, request) => {
             
             // Attach immediately and start playing greeting
             console.log("🎬 Attaching session and starting audio playback...");
-            currentSession.attachToVonage(sendVonageAudio, onFirstAudio, startQueueProcessor);
+            currentSession.attachToVonage(sendVonageAudio, onFirstAudio);
           } else {
             // SLOW PATH: Create new session (async)
             console.log(`⚠️ No pre-warmed session - creating new session for ${conversationId}`);
@@ -796,7 +727,7 @@ wss.on("connection", async (vonageWS, request) => {
                 console.log(`✅ New session ready for ${conversationId}`);
                 
                 // Attach once ready
-                currentSession.attachToVonage(sendVonageAudio, onFirstAudio, startQueueProcessor);
+                currentSession.attachToVonage(sendVonageAudio, onFirstAudio);
               } catch (error) {
                 console.error(`❌ Failed to create session: ${error.message}`);
               }
@@ -847,12 +778,6 @@ wss.on("connection", async (vonageWS, request) => {
       console.log("🛑 Cleaned up keep-alive interval");
     }
     
-    // Clean up audio queue processor
-    if (queueProcessor) {
-      clearInterval(queueProcessor);
-      queueProcessor = null;
-      console.log("🛑 Cleaned up audio queue processor");
-    }
     
     // Close session
     if (currentSession) {
