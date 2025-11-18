@@ -281,6 +281,7 @@ class PrewarmedSession {
             if (this.onFirstAudio && !this.firstAudioSent) {
               this.firstAudioSent = true;
               this.onFirstAudio();
+              console.log(`🎵 Sending first audio delta to Vonage (${evt.delta.length} chars base64)`);
             }
           } else {
             // Buffer until Vonage ready
@@ -488,11 +489,11 @@ async function prewarmOpenAIConnection(conversationId, businessId) {
   }
 }
 
-// Cleanup old pre-warmed sessions after 30 seconds
+// Cleanup old pre-warmed sessions after 90 seconds
 setInterval(() => {
   const now = Date.now();
   for (const [conversationId, data] of prewarmPool.entries()) {
-    if (now - data.timestamp > 30000) {
+    if (now - data.timestamp > 90000) {
       console.log(`🧹 Cleaning up expired pre-warmed session: ${conversationId}`);
       if (data.session) {
         data.session.close();
@@ -500,7 +501,7 @@ setInterval(() => {
       prewarmPool.delete(conversationId);
     }
   }
-}, 5000);
+}, 15000);
 
 // Add connection attempt logging
 wss.on('headers', (headers, request) => {
@@ -589,6 +590,7 @@ wss.on("connection", async (vonageWS, request) => {
   }
   
   // Helper function to send audio to Vonage
+  let audioPacketCount = 0;
   const sendVonageAudio = (base64Audio) => {
     if (vonageWS.readyState === WebSocket.OPEN) {
       // OpenAI sends 24kHz PCM16, Vonage expects 16kHz PCM16
@@ -596,6 +598,10 @@ wss.on("connection", async (vonageWS, request) => {
       const audioBuffer16k = resample24to16(audioBuffer24k);
       vonageWS.send(audioBuffer16k);
       lastAudioSent = Date.now();
+      audioPacketCount++;
+      if (audioPacketCount === 1 || audioPacketCount % 50 === 0) {
+        console.log(`📤 Sent audio packet #${audioPacketCount} to Vonage (24k: ${audioBuffer24k.length}b → 16k: ${audioBuffer16k.length}b)`);
+      }
     }
   };
   
