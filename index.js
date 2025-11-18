@@ -593,33 +593,34 @@ wss.on("connection", async (vonageWS, request) => {
   let audioPacketCount = 0;
   const audioQueue = [];
   let queueProcessor = null;
+  let leftoverBytes = Buffer.alloc(0); // Accumulate partial chunks
   
   const sendVonageAudio = (base64Audio) => {
     if (vonageWS.readyState !== WebSocket.OPEN) return;
-    
-    // Debug: Confirm pacing code is active
-    if (audioPacketCount === 0) {
-      console.log("🎯 Using PACED audio transmission (v2 - queue-based)");
-    }
     
     // OpenAI sends 24kHz PCM16, Vonage expects 16kHz PCM16
     const audioBuffer24k = Buffer.from(base64Audio, 'base64');
     const audioBuffer16k = resample24to16(audioBuffer24k);
     
+    // Accumulate: prepend leftover bytes from previous call
+    const combined = Buffer.concat([leftoverBytes, audioBuffer16k]);
+    
     // Vonage expects EXACTLY 640 bytes per packet (20ms of 16kHz PCM16)
-    // Split the resampled audio into 640-byte chunks and queue them
+    // Split the combined buffer into 640-byte chunks
     const PACKET_SIZE = 640;
-    for (let offset = 0; offset < audioBuffer16k.length; offset += PACKET_SIZE) {
-      const chunk = audioBuffer16k.slice(offset, offset + PACKET_SIZE);
-      
-      // Only queue if we have a full packet (640 bytes)
-      if (chunk.length === PACKET_SIZE) {
-        audioQueue.push(chunk);
-      }
+    let offset = 0;
+    while (offset + PACKET_SIZE <= combined.length) {
+      const chunk = combined.slice(offset, offset + PACKET_SIZE);
+      audioQueue.push(chunk);
+      offset += PACKET_SIZE;
     }
     
+    // Save remaining bytes for next call
+    leftoverBytes = combined.slice(offset);
+    
     // Start queue processor if not running
-    if (!queueProcessor && audioQueue.length > 0) {
+    if (!queueProcessor) {
+      console.log("🎬 Starting audio queue processor (50 packets/sec)");
       queueProcessor = setInterval(() => {
         if (audioQueue.length > 0 && vonageWS.readyState === WebSocket.OPEN) {
           const chunk = audioQueue.shift();
@@ -630,8 +631,6 @@ wss.on("connection", async (vonageWS, request) => {
           if (audioPacketCount === 1 || audioPacketCount % 50 === 0) {
             console.log(`📤 Sent audio packet #${audioPacketCount} to Vonage (${audioQueue.length} queued)`);
           }
-        } else if (audioQueue.length === 0) {
-          // Queue empty, processor will continue for keep-alive
         }
       }, 20); // Send 1 packet every 20ms (50 packets/second)
     }
