@@ -637,7 +637,32 @@ wss.on("connection", async (vonageWS, request) => {
     const silenceBuffer = Buffer.alloc(640, 0);
     console.log(`🎬 Starting unified audio sender (50 packets/sec, ${audioQueue.length} packets queued)`);
     
-    // Start the unified sender FIRST, before stopping keep-alive
+    // Send FIRST packet IMMEDIATELY to prevent gap in audio stream
+    console.log(`🔍 DEBUG: About to send immediate packet, WS state = ${vonageWS.readyState}, queue = ${audioQueue.length}`);
+    if (vonageWS.readyState === WebSocket.OPEN) {
+      console.log(`🔍 DEBUG: Inside immediate send block`);
+      if (audioQueue.length > 0) {
+        console.log(`🔍 DEBUG: Sending audio packet immediately`);
+        const chunk = audioQueue.shift();
+        try {
+          vonageWS.send(chunk);
+          lastAudioSent = Date.now();
+          audioPacketCount++;
+          console.log(`📤 Sent IMMEDIATE audio packet #${audioPacketCount} to Vonage (${audioQueue.length} queued)`);
+        } catch (error) {
+          console.error(`❌ Error sending immediate packet: ${error.message}`);
+        }
+      } else {
+        console.log(`🔍 DEBUG: Sending silence immediately`);
+        vonageWS.send(silenceBuffer);
+        lastAudioSent = Date.now();
+        console.log(`🔇 Sent immediate silence packet`);
+      }
+    } else {
+      console.log(`🔍 DEBUG: WebSocket not OPEN, cannot send immediate packet`);
+    }
+    
+    // Now start the interval for subsequent packets
     queueProcessor = setInterval(() => {
       try {
         if (vonageWS.readyState !== WebSocket.OPEN) {
@@ -651,7 +676,7 @@ wss.on("connection", async (vonageWS, request) => {
           lastAudioSent = Date.now();
           audioPacketCount++;
           
-          if (audioPacketCount === 1 || audioPacketCount % 50 === 0 || audioPacketCount <= 5) {
+          if (audioPacketCount % 50 === 0 || audioPacketCount <= 5) {
             console.log(`📤 Sent audio packet #${audioPacketCount} to Vonage (${audioQueue.length} queued)`);
           }
         } else {
@@ -664,7 +689,7 @@ wss.on("connection", async (vonageWS, request) => {
       }
     }, 20); // Send 1 packet every 20ms (50 packets/second)
     
-    // NOW stop the keep-alive, after the new sender is running
+    // NOW stop the keep-alive, after the new sender is running and first packet sent
     if (keepAliveInterval) {
       clearInterval(keepAliveInterval);
       keepAliveInterval = null;
