@@ -590,10 +590,9 @@ wss.on("connection", async (vonageWS, request) => {
   // Helper function to send audio to Vonage
   const sendVonageAudio = (base64Audio) => {
     if (vonageWS.readyState === WebSocket.OPEN) {
-      // OpenAI sends 24kHz PCM16, Vonage expects 16kHz PCM16
-      const audioBuffer24k = Buffer.from(base64Audio, 'base64');
-      const audioBuffer16k = resample24to16(audioBuffer24k);
-      vonageWS.send(audioBuffer16k);
+      // OpenAI sends 16kHz PCM16, Vonage expects 16kHz PCM16 - no resampling needed
+      const audioBuffer = Buffer.from(base64Audio, 'base64');
+      vonageWS.send(audioBuffer);
     }
   };
   
