@@ -567,6 +567,7 @@ wss.on("connection", async (vonageWS, request) => {
   let firstAudioReceived = false;
   let vonageStreamReady = false;
   let currentSession = null; // Will hold PrewarmedSession instance
+  let lastAudioSent = 0; // Timestamp of last audio packet sent
   
   console.log("🔄 Call state initialized for conversation:", conversationId);
   
@@ -590,21 +591,19 @@ wss.on("connection", async (vonageWS, request) => {
   // Helper function to send audio to Vonage
   const sendVonageAudio = (base64Audio) => {
     if (vonageWS.readyState === WebSocket.OPEN) {
-      // OpenAI sends 16kHz PCM16, Vonage expects 16kHz PCM16 - no resampling needed
-      const audioBuffer = Buffer.from(base64Audio, 'base64');
-      vonageWS.send(audioBuffer);
+      // OpenAI sends 24kHz PCM16, Vonage expects 16kHz PCM16
+      const audioBuffer24k = Buffer.from(base64Audio, 'base64');
+      const audioBuffer16k = resample24to16(audioBuffer24k);
+      vonageWS.send(audioBuffer16k);
+      lastAudioSent = Date.now();
     }
   };
   
-  // Callback when first audio arrives (stops keep-alive)
+  // Callback when first audio arrives (just track, don't stop keep-alive)
   const onFirstAudio = () => {
     if (!firstAudioReceived) {
       firstAudioReceived = true;
-      if (keepAliveInterval) {
-        clearInterval(keepAliveInterval);
-        keepAliveInterval = null;
-        console.log("🛑 Stopped keep-alive (first audio from session)");
-      }
+      console.log("🎵 First audio from OpenAI (keep-alive continues)");
     }
   };
   
@@ -652,19 +651,20 @@ wss.on("connection", async (vonageWS, request) => {
         if (msg.event === "websocket:connected") {
           console.log("📞 Vonage websocket:connected, content-type:", msg['content-type']);
           
-          // Start keep-alive immediately
-          if (!firstAudioReceived) {
-            const silenceBuffer = Buffer.alloc(640, 0);
-            console.log("🔇 Starting silence keep-alive...");
+          // Start smart keep-alive: only send silence when there's a gap in audio
+          const silenceBuffer = Buffer.alloc(640, 0);
+          console.log("🔇 Starting smart keep-alive...");
+          
+          keepAliveInterval = setInterval(() => {
             if (vonageWS.readyState === WebSocket.OPEN) {
-              vonageWS.send(silenceBuffer);
-            }
-            keepAliveInterval = setInterval(() => {
-              if (vonageWS.readyState === WebSocket.OPEN) {
+              const timeSinceLastAudio = Date.now() - lastAudioSent;
+              // Only send silence if no audio was sent in last 15ms
+              if (timeSinceLastAudio > 15) {
                 vonageWS.send(silenceBuffer);
+                lastAudioSent = Date.now();
               }
-            }, 20);
-          }
+            }
+          }, 20);
           
           // Acquire session (pre-warmed or new)
           acquireSession()
