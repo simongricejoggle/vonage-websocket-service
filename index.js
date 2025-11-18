@@ -592,15 +592,27 @@ wss.on("connection", async (vonageWS, request) => {
   // Helper function to send audio to Vonage
   let audioPacketCount = 0;
   const sendVonageAudio = (base64Audio) => {
-    if (vonageWS.readyState === WebSocket.OPEN) {
-      // OpenAI sends 24kHz PCM16, Vonage expects 16kHz PCM16
-      const audioBuffer24k = Buffer.from(base64Audio, 'base64');
-      const audioBuffer16k = resample24to16(audioBuffer24k);
-      vonageWS.send(audioBuffer16k);
-      lastAudioSent = Date.now();
-      audioPacketCount++;
-      if (audioPacketCount === 1 || audioPacketCount % 50 === 0) {
-        console.log(`📤 Sent audio packet #${audioPacketCount} to Vonage (24k: ${audioBuffer24k.length}b → 16k: ${audioBuffer16k.length}b)`);
+    if (vonageWS.readyState !== WebSocket.OPEN) return;
+    
+    // OpenAI sends 24kHz PCM16, Vonage expects 16kHz PCM16
+    const audioBuffer24k = Buffer.from(base64Audio, 'base64');
+    const audioBuffer16k = resample24to16(audioBuffer24k);
+    
+    // Vonage expects EXACTLY 640 bytes per packet (20ms of 16kHz PCM16)
+    // Split the resampled audio into 640-byte chunks
+    const PACKET_SIZE = 640;
+    for (let offset = 0; offset < audioBuffer16k.length; offset += PACKET_SIZE) {
+      const chunk = audioBuffer16k.slice(offset, offset + PACKET_SIZE);
+      
+      // Only send if we have a full packet (640 bytes)
+      if (chunk.length === PACKET_SIZE) {
+        vonageWS.send(chunk);
+        lastAudioSent = Date.now();
+        audioPacketCount++;
+        
+        if (audioPacketCount === 1 || audioPacketCount % 50 === 0) {
+          console.log(`📤 Sent audio packet #${audioPacketCount} to Vonage (640 bytes)`);
+        }
       }
     }
   };
