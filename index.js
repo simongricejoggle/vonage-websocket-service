@@ -631,27 +631,17 @@ wss.on("connection", async (vonageWS, request) => {
       return; // Already running
     }
     
-    console.log(`🔍 DEBUG: keepAliveInterval exists? ${!!keepAliveInterval}`);
     console.log(`🔍 DEBUG: audioQueue.length = ${audioQueue.length}`);
-    console.log(`🔍 DEBUG: vonageWS.readyState = ${vonageWS.readyState}`);
-    
-    // Stop keep-alive since queue processor will handle it
-    if (keepAliveInterval) {
-      clearInterval(keepAliveInterval);
-      keepAliveInterval = null;
-      console.log("🛑 Stopped keep-alive (queue processor will handle silence)");
-    } else {
-      console.log("⚠️ No keep-alive interval to stop");
-    }
+    console.log(`🔍 DEBUG: vonageWS.readyState = ${vonageWS.readyState} (1=OPEN, 2=CLOSING, 3=CLOSED)`);
     
     const silenceBuffer = Buffer.alloc(640, 0);
-    console.log(`🎬 Starting audio queue processor (50 packets/sec, ${audioQueue.length} packets queued)`);
+    console.log(`🎬 Starting unified audio sender (50 packets/sec, ${audioQueue.length} packets queued)`);
     
+    // Start the unified sender FIRST, before stopping keep-alive
     queueProcessor = setInterval(() => {
       try {
         if (vonageWS.readyState !== WebSocket.OPEN) {
-          console.log(`⚠️ WebSocket not open (state: ${vonageWS.readyState})`);
-          return;
+          return; // Silently skip when not open
         }
         
         if (audioQueue.length > 0) {
@@ -670,11 +660,18 @@ wss.on("connection", async (vonageWS, request) => {
           lastAudioSent = Date.now();
         }
       } catch (error) {
-        console.error(`❌ Error in queue processor: ${error.message}`);
+        console.error(`❌ Error in audio sender: ${error.message}`);
       }
     }, 20); // Send 1 packet every 20ms (50 packets/second)
     
-    console.log(`✅ Queue processor interval created: ${!!queueProcessor}`);
+    // NOW stop the keep-alive, after the new sender is running
+    if (keepAliveInterval) {
+      clearInterval(keepAliveInterval);
+      keepAliveInterval = null;
+      console.log("🛑 Stopped separate keep-alive (unified sender now handles it)");
+    }
+    
+    console.log(`✅ Unified audio sender started successfully`);
   };
   
   // Callback when first audio arrives (just track, don't stop keep-alive)
@@ -751,34 +748,37 @@ wss.on("connection", async (vonageWS, request) => {
           }, 20);
           
           // Acquire session AND attach immediately (websocket:connected = media bridge ready)
-          if (prewarmPool.has(conversationId)) {
-            // FAST PATH: Pre-warmed session (synchronous)
-            const poolData = prewarmPool.get(conversationId);
-            prewarmPool.delete(conversationId);
-            currentSession = poolData.session;
-            console.log(`🎯 Using pre-warmed session for ${conversationId}`);
-            console.log(`✅ Session acquired and ready for ${conversationId}`);
-            
-            // Attach immediately and start playing greeting
-            console.log("🎬 Attaching session and starting audio playback...");
-            currentSession.attachToVonage(sendVonageAudio, onFirstAudio, startQueueProcessor);
-          } else {
-            // SLOW PATH: Create new session (async)
-            console.log(`⚠️ No pre-warmed session - creating new session for ${conversationId}`);
-            (async () => {
-              try {
-                const session = new PrewarmedSession(conversationId, businessId);
-                await session.initialize();
-                currentSession = session;
-                console.log(`✅ New session ready for ${conversationId}`);
-                
-                // Attach once ready
-                currentSession.attachToVonage(sendVonageAudio, onFirstAudio, startQueueProcessor);
-              } catch (error) {
-                console.error(`❌ Failed to create session: ${error.message}`);
-              }
-            })();
-          }
+          // Give Vonage a tick to complete handshake before we start sending audio
+          setImmediate(() => {
+            if (prewarmPool.has(conversationId)) {
+              // FAST PATH: Pre-warmed session (synchronous)
+              const poolData = prewarmPool.get(conversationId);
+              prewarmPool.delete(conversationId);
+              currentSession = poolData.session;
+              console.log(`🎯 Using pre-warmed session for ${conversationId}`);
+              console.log(`✅ Session acquired and ready for ${conversationId}`);
+              
+              // Attach immediately and start playing greeting
+              console.log("🎬 Attaching session and starting audio playback...");
+              currentSession.attachToVonage(sendVonageAudio, onFirstAudio, startQueueProcessor);
+            } else {
+              // SLOW PATH: Create new session (async)
+              console.log(`⚠️ No pre-warmed session - creating new session for ${conversationId}`);
+              (async () => {
+                try {
+                  const session = new PrewarmedSession(conversationId, businessId);
+                  await session.initialize();
+                  currentSession = session;
+                  console.log(`✅ New session ready for ${conversationId}`);
+                  
+                  // Attach once ready
+                  currentSession.attachToVonage(sendVonageAudio, onFirstAudio, startQueueProcessor);
+                } catch (error) {
+                  console.error(`❌ Failed to create session: ${error.message}`);
+                }
+              })();
+            }
+          });
         }
       } else {
         // This is binary audio data (640 bytes of L16 PCM)
@@ -807,11 +807,15 @@ wss.on("connection", async (vonageWS, request) => {
   });
 
   vonageWS.on("error", (error) => {
-    console.error("❌ Vonage WebSocket error:", error);
+    console.error("❌ Vonage WebSocket error:", error.message || error);
+    console.error("❌ Error stack:", error.stack);
+    console.log(`🔍 DEBUG: Error occurred, WebSocket state: ${vonageWS.readyState}`);
   });
 
-  vonageWS.on("close", async () => {
-    console.log("📞 Vonage connection closed");
+  vonageWS.on("close", async (code, reason) => {
+    console.log(`📞 Vonage connection closed - Code: ${code}, Reason: ${reason || 'none'}`);
+    console.log(`🔍 DEBUG: Close triggered after ${audioPacketCount} packets sent`);
+    console.log(`🔍 DEBUG: ${audioQueue.length} packets still in queue`);
     
     // Clean up keep-alive interval
     if (keepAliveInterval) {
