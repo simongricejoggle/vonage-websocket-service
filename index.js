@@ -590,13 +590,13 @@ wss.on("connection", async (vonageWS, request) => {
     return session;
   }
   
-  // Simple: Send audio to Vonage immediately, no queuing
+  // Audio queue with proper pacing (50 packets/sec)
   let audioPacketCount = 0;
-  let leftoverBytes = Buffer.alloc(0); // Accumulate partial chunks
+  let leftoverBytes = Buffer.alloc(0);
+  const audioQueue = [];
+  let audioSender = null;
   
   const sendVonageAudio = (base64Audio) => {
-    if (vonageWS.readyState !== WebSocket.OPEN) return;
-    
     // OpenAI sends 24kHz PCM16, Vonage expects 16kHz PCM16
     const audioBuffer24k = Buffer.from(base64Audio, 'base64');
     const audioBuffer16k = resample24to16(audioBuffer24k);
@@ -605,30 +605,54 @@ wss.on("connection", async (vonageWS, request) => {
     const combined = Buffer.concat([leftoverBytes, audioBuffer16k]);
     
     // Vonage expects EXACTLY 640 bytes per packet (20ms of 16kHz PCM16)
-    // Split and send immediately - no queue
+    // Queue packets for proper pacing
     const PACKET_SIZE = 640;
     let offset = 0;
     while (offset + PACKET_SIZE <= combined.length) {
       const chunk = combined.slice(offset, offset + PACKET_SIZE);
-      
-      // Send immediately to Vonage
-      try {
-        vonageWS.send(chunk);
-        audioPacketCount++;
-        lastAudioSent = Date.now();
-        
-        if (audioPacketCount <= 3 || audioPacketCount % 100 === 0) {
-          console.log(`📤 Sent audio packet #${audioPacketCount} to Vonage`);
-        }
-      } catch (error) {
-        console.error(`❌ Error sending audio: ${error.message}`);
-      }
-      
+      audioQueue.push(chunk);
       offset += PACKET_SIZE;
     }
     
     // Save remaining bytes for next call
     leftoverBytes = combined.slice(offset);
+    
+    // Start sender if not running
+    if (!audioSender) {
+      startAudioSender();
+    }
+  };
+  
+  const startAudioSender = () => {
+    const silenceBuffer = Buffer.alloc(640, 0);
+    
+    // Stop keep-alive (sender will handle it)
+    if (keepAliveInterval) {
+      clearInterval(keepAliveInterval);
+      keepAliveInterval = null;
+    }
+    
+    // Send at 50 packets/sec (one every 20ms)
+    audioSender = setInterval(() => {
+      if (vonageWS.readyState !== WebSocket.OPEN) return;
+      
+      if (audioQueue.length > 0) {
+        const chunk = audioQueue.shift();
+        vonageWS.send(chunk);
+        audioPacketCount++;
+        lastAudioSent = Date.now();
+        
+        if (audioPacketCount <= 3 || audioPacketCount % 100 === 0) {
+          console.log(`📤 Sent audio packet #${audioPacketCount} to Vonage (${audioQueue.length} queued)`);
+        }
+      } else {
+        // Send silence to keep connection alive
+        vonageWS.send(silenceBuffer);
+        lastAudioSent = Date.now();
+      }
+    }, 20);
+    
+    console.log("🎵 Audio sender started (50 packets/sec)");
   };
   
   // Callback when first audio arrives
@@ -770,11 +794,14 @@ wss.on("connection", async (vonageWS, request) => {
     console.log(`📞 Vonage connection closed - Code: ${code}, Reason: ${reason || 'none'}`);
     console.log(`🔍 DEBUG: Close triggered after ${audioPacketCount} packets sent`);
     
-    // Clean up keep-alive interval
+    // Clean up intervals
     if (keepAliveInterval) {
       clearInterval(keepAliveInterval);
       keepAliveInterval = null;
-      console.log("🛑 Cleaned up keep-alive interval");
+    }
+    if (audioSender) {
+      clearInterval(audioSender);
+      audioSender = null;
     }
     
     
