@@ -616,6 +616,12 @@ wss.on("connection", async (vonageWS, request) => {
     
     // Save remaining bytes for next call
     leftoverBytes = combined.slice(offset);
+    
+    // Start sender if not already running and we have packets
+    if (!audioSender && audioQueue.length > 0) {
+      console.log(`🎵 Auto-starting audio sender (${audioQueue.length} packets queued)`);
+      startAudioSender();
+    }
   };
   
   const startAudioSender = () => {
@@ -727,12 +733,9 @@ wss.on("connection", async (vonageWS, request) => {
         
         if (msg.event === "websocket:connected") {
           console.log("📞 Vonage websocket:connected, content-type:", msg['content-type']);
-          console.log("✅ Vonage WebSocket connected - waiting for media stream ready signal");
+          console.log("✅ Vonage WebSocket connected");
           
-          // DON'T start audio sender yet - wait for first audio packet from Vonage
-          // This signals their media bridge is actually ready to receive
-          
-          // Acquire session AND attach immediately (will buffer audio until media ready)
+          // Acquire session first
           if (prewarmPool.has(conversationId)) {
             // FAST PATH: Pre-warmed session (synchronous)
             const poolData = prewarmPool.get(conversationId);
@@ -744,6 +747,14 @@ wss.on("connection", async (vonageWS, request) => {
             // Attach immediately and start playing greeting
             console.log("🎬 Attaching session and starting audio playback...");
             currentSession.attachToVonage(sendVonageAudio, onFirstAudio);
+            
+            // Start audio sender AFTER attaching (queue is now populated with buffered greeting)
+            if (audioQueue.length > 0) {
+              console.log(`🎵 Starting audio sender with ${audioQueue.length} packets queued`);
+              startAudioSender();
+            } else {
+              console.log("⚠️ No audio queued after attach - will start sender when audio arrives");
+            }
           } else {
             // SLOW PATH: Create new session (async)
             console.log(`⚠️ No pre-warmed session - creating new session for ${conversationId}`);
@@ -756,6 +767,12 @@ wss.on("connection", async (vonageWS, request) => {
                 
                 // Attach once ready
                 currentSession.attachToVonage(sendVonageAudio, onFirstAudio);
+                
+                // Start audio sender if we have queued audio
+                if (audioQueue.length > 0) {
+                  console.log(`🎵 Starting audio sender with ${audioQueue.length} packets queued`);
+                  startAudioSender();
+                }
               } catch (error) {
                 console.error(`❌ Failed to create session: ${error.message}`);
               }
@@ -765,13 +782,10 @@ wss.on("connection", async (vonageWS, request) => {
       } else {
         // This is binary audio data (640 bytes of L16 PCM)
         if (isBuffer && raw.length === 640) {
-          // First audio packet FROM Vonage - this means media bridge is READY
+          // First audio packet FROM user
           if (!vonageStreamReady) {
             vonageStreamReady = true;
-            console.log("✅ Vonage media stream READY (received first audio packet from user)");
-            
-            // NOW start audio sender - Vonage is ready to receive
-            startAudioSender();
+            console.log("✅ Vonage receiving audio from user (first packet)");
           }
           
           // Forward audio to session
