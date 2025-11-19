@@ -616,11 +616,6 @@ wss.on("connection", async (vonageWS, request) => {
     
     // Save remaining bytes for next call
     leftoverBytes = combined.slice(offset);
-    
-    // Start sender if not running
-    if (!audioSender) {
-      startAudioSender();
-    }
   };
   
   const startAudioSender = () => {
@@ -629,29 +624,39 @@ wss.on("connection", async (vonageWS, request) => {
       return;
     }
     
+    // Check ONCE at creation - not on every tick
+    if (vonageWS.readyState !== WebSocket.OPEN) {
+      console.log(`❌ Cannot start audio sender - WebSocket not OPEN (state: ${vonageWS.readyState})`);
+      return;
+    }
+    
     const silenceBuffer = Buffer.alloc(640, 0);
     
     // Send at 50 packets/sec (one every 20ms)
     audioSender = setInterval(() => {
-      if (vonageWS.readyState !== WebSocket.OPEN) return;
-      
-      if (audioQueue.length > 0) {
-        const chunk = audioQueue.shift();
-        vonageWS.send(chunk);
-        audioPacketCount++;
-        lastAudioSent = Date.now();
-        
-        if (audioPacketCount <= 3 || audioPacketCount % 100 === 0) {
-          console.log(`📤 Sent audio packet #${audioPacketCount} to Vonage (${audioQueue.length} queued)`);
+      try {
+        if (audioQueue.length > 0) {
+          const chunk = audioQueue.shift();
+          vonageWS.send(chunk);
+          audioPacketCount++;
+          lastAudioSent = Date.now();
+          
+          if (audioPacketCount <= 3 || audioPacketCount % 100 === 0) {
+            console.log(`📤 Sent audio packet #${audioPacketCount} to Vonage (${audioQueue.length} queued)`);
+          }
+        } else {
+          // Send silence to keep connection alive
+          vonageWS.send(silenceBuffer);
+          lastAudioSent = Date.now();
         }
-      } else {
-        // Send silence to keep connection alive
-        vonageWS.send(silenceBuffer);
-        lastAudioSent = Date.now();
+      } catch (error) {
+        console.error(`❌ Error in audio sender: ${error.message}`);
+        clearInterval(audioSender);
+        audioSender = null;
       }
     }, 20);
     
-    console.log("🎵 Audio sender started (50 packets/sec)");
+    console.log(`🎵 Audio sender started (50 packets/sec, ${audioQueue.length} packets queued, WS state: ${vonageWS.readyState})`);
   };
   
   // Callback when first audio arrives
@@ -706,6 +711,9 @@ wss.on("connection", async (vonageWS, request) => {
         if (msg.event === "websocket:connected") {
           console.log("📞 Vonage websocket:connected, content-type:", msg['content-type']);
           console.log("✅ Vonage ready to receive audio");
+          
+          // START AUDIO SENDER IMMEDIATELY - it will send silence until OpenAI audio arrives
+          startAudioSender();
           
           // Acquire session AND attach immediately (websocket:connected = media bridge ready)
           if (prewarmPool.has(conversationId)) {
