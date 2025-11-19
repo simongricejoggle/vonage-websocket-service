@@ -727,12 +727,12 @@ wss.on("connection", async (vonageWS, request) => {
         
         if (msg.event === "websocket:connected") {
           console.log("📞 Vonage websocket:connected, content-type:", msg['content-type']);
-          console.log("✅ Vonage ready to receive audio");
+          console.log("✅ Vonage WebSocket connected - waiting for media stream ready signal");
           
-          // START AUDIO SENDER IMMEDIATELY - it will send silence until OpenAI audio arrives
-          startAudioSender();
+          // DON'T start audio sender yet - wait for first audio packet from Vonage
+          // This signals their media bridge is actually ready to receive
           
-          // Acquire session AND attach immediately (websocket:connected = media bridge ready)
+          // Acquire session AND attach immediately (will buffer audio until media ready)
           if (prewarmPool.has(conversationId)) {
             // FAST PATH: Pre-warmed session (synchronous)
             const poolData = prewarmPool.get(conversationId);
@@ -765,10 +765,13 @@ wss.on("connection", async (vonageWS, request) => {
       } else {
         // This is binary audio data (640 bytes of L16 PCM)
         if (isBuffer && raw.length === 640) {
-          // First audio packet FROM user
+          // First audio packet FROM Vonage - this means media bridge is READY
           if (!vonageStreamReady) {
             vonageStreamReady = true;
-            console.log("✅ Vonage receiving audio from user (first packet)");
+            console.log("✅ Vonage media stream READY (received first audio packet from user)");
+            
+            // NOW start audio sender - Vonage is ready to receive
+            startAudioSender();
           }
           
           // Forward audio to session
