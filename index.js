@@ -635,14 +635,31 @@ wss.on("connection", async (vonageWS, request) => {
     // Send at 50 packets/sec (one every 20ms)
     audioSender = setInterval(() => {
       try {
+        // Check if WebSocket is still open
+        if (vonageWS.readyState !== WebSocket.OPEN) {
+          console.log(`⚠️ WebSocket closed mid-stream (state: ${vonageWS.readyState}), stopping sender`);
+          clearInterval(audioSender);
+          audioSender = null;
+          return;
+        }
+        
         if (audioQueue.length > 0) {
           const chunk = audioQueue.shift();
+          
+          // Validate chunk before sending
+          if (!Buffer.isBuffer(chunk) || chunk.length !== 640) {
+            console.error(`❌ Invalid chunk: isBuffer=${Buffer.isBuffer(chunk)}, length=${chunk?.length}`);
+            return;
+          }
+          
           vonageWS.send(chunk);
           audioPacketCount++;
           lastAudioSent = Date.now();
           
-          if (audioPacketCount <= 3 || audioPacketCount % 100 === 0) {
-            console.log(`📤 Sent audio packet #${audioPacketCount} to Vonage (${audioQueue.length} queued)`);
+          if (audioPacketCount <= 10 || audioPacketCount % 100 === 0) {
+            // Check if audio is actually not silence
+            const hasAudio = chunk.some(byte => byte !== 0);
+            console.log(`📤 Sent audio packet #${audioPacketCount} to Vonage (${audioQueue.length} queued, hasAudio: ${hasAudio})`);
           }
         } else {
           // Send silence to keep connection alive
@@ -650,7 +667,7 @@ wss.on("connection", async (vonageWS, request) => {
           lastAudioSent = Date.now();
         }
       } catch (error) {
-        console.error(`❌ Error in audio sender: ${error.message}`);
+        console.error(`❌ Error in audio sender: ${error.message}`, error.stack);
         clearInterval(audioSender);
         audioSender = null;
       }
@@ -775,6 +792,7 @@ wss.on("connection", async (vonageWS, request) => {
     console.error("❌ Vonage WebSocket error:", error.message || error);
     console.error("❌ Error stack:", error.stack);
     console.log(`🔍 DEBUG: Error occurred, WebSocket state: ${vonageWS.readyState}`);
+    console.log(`🔍 DEBUG: Packets sent so far: ${audioPacketCount}, queue length: ${audioQueue.length}`);
   });
 
   vonageWS.on("close", async (code, reason) => {
