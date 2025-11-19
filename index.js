@@ -624,13 +624,12 @@ wss.on("connection", async (vonageWS, request) => {
   };
   
   const startAudioSender = () => {
-    const silenceBuffer = Buffer.alloc(640, 0);
-    
-    // Stop keep-alive (sender will handle it)
-    if (keepAliveInterval) {
-      clearInterval(keepAliveInterval);
-      keepAliveInterval = null;
+    if (audioSender) {
+      console.log("⚠️ Audio sender already running");
+      return;
     }
+    
+    const silenceBuffer = Buffer.alloc(640, 0);
     
     // Send at 50 packets/sec (one every 20ms)
     audioSender = setInterval(() => {
@@ -706,27 +705,7 @@ wss.on("connection", async (vonageWS, request) => {
         
         if (msg.event === "websocket:connected") {
           console.log("📞 Vonage websocket:connected, content-type:", msg['content-type']);
-          
-          // Start smart keep-alive: only send silence when there's a gap in audio
-          const silenceBuffer = Buffer.alloc(640, 0);
-          console.log("🔇 Starting smart keep-alive...");
-          
-          // Send initial silence packet immediately
-          if (vonageWS.readyState === WebSocket.OPEN) {
-            vonageWS.send(silenceBuffer);
-            lastAudioSent = Date.now();
-          }
-          
-          keepAliveInterval = setInterval(() => {
-            if (vonageWS.readyState === WebSocket.OPEN) {
-              const timeSinceLastAudio = Date.now() - lastAudioSent;
-              // Only send silence if no audio was sent in last 15ms
-              if (timeSinceLastAudio > 15) {
-                vonageWS.send(silenceBuffer);
-                lastAudioSent = Date.now();
-              }
-            }
-          }, 20);
+          console.log("✅ Vonage ready to receive audio");
           
           // Acquire session AND attach immediately (websocket:connected = media bridge ready)
           if (prewarmPool.has(conversationId)) {
@@ -792,16 +771,13 @@ wss.on("connection", async (vonageWS, request) => {
 
   vonageWS.on("close", async (code, reason) => {
     console.log(`📞 Vonage connection closed - Code: ${code}, Reason: ${reason || 'none'}`);
-    console.log(`🔍 DEBUG: Close triggered after ${audioPacketCount} packets sent`);
+    console.log(`🔍 DEBUG: Close triggered after ${audioPacketCount} packets sent, ${audioQueue.length} still queued`);
     
-    // Clean up intervals
-    if (keepAliveInterval) {
-      clearInterval(keepAliveInterval);
-      keepAliveInterval = null;
-    }
+    // Clean up audio sender
     if (audioSender) {
       clearInterval(audioSender);
       audioSender = null;
+      console.log("🛑 Cleaned up audio sender");
     }
     
     
