@@ -767,17 +767,17 @@ wss.on("connection", async (vonageWS, request) => {
         if (msg.event === "websocket:connected") {
           console.log("📞 Vonage websocket:connected, content-type:", msg['content-type']);
           
-          // CRITICAL: Send media_ready acknowledgement to complete handshake
+          // Send media_ready acknowledgement (may be required by Vonage)
           const mediaReadyResponse = {
             event: "websocket:media_ready"
           };
           vonageWS.send(JSON.stringify(mediaReadyResponse));
           console.log("✅ Sent websocket:media_ready acknowledgement");
           
-          vonageConnected = true; // Mark as connected
+          vonageConnected = true;
+          vonageMediaReady = true;
           
-          // Acquire session and attach, but DON'T start sending audio yet
-          // We need to wait for Vonage's media_start event
+          // Acquire session and attach - audio will queue during attachment
           if (prewarmPool.has(conversationId)) {
             const poolData = prewarmPool.get(conversationId);
             prewarmPool.delete(conversationId);
@@ -785,11 +785,14 @@ wss.on("connection", async (vonageWS, request) => {
             console.log(`🎯 Using pre-warmed session for ${conversationId}`);
             console.log(`✅ Session acquired and ready for ${conversationId}`);
             
-            // Attach immediately (this will queue audio)
-            console.log("🎬 Attaching session and queueing audio...");
+            // Attach session (this queues buffered audio from greeting)
+            console.log("🎬 Attaching session and flushing buffered audio...");
             currentSession.attachToVonage(sendVonageAudio, onFirstAudio);
             console.log(`📦 Audio queued: ${audioQueue.length} packets`);
-            console.log("⏳ Waiting for Vonage websocket:media_start before sending audio...");
+            
+            // Start sending audio immediately
+            console.log("🎵 Starting audio transmission immediately...");
+            startAudioSender();
           } else {
             // SLOW PATH: Create new session (async)
             console.log(`⚠️ No pre-warmed session - creating new session for ${conversationId}`);
@@ -803,29 +806,18 @@ wss.on("connection", async (vonageWS, request) => {
                 // Attach once ready (audio will queue)
                 currentSession.attachToVonage(sendVonageAudio, onFirstAudio);
                 console.log(`📦 Audio queued: ${audioQueue.length} packets`);
-                console.log("⏳ Waiting for Vonage websocket:media_start before sending audio...");
+                
+                // Start sending audio
+                console.log("🎵 Starting audio transmission...");
+                startAudioSender();
               } catch (error) {
                 console.error(`❌ Failed to create session: ${error.message}`);
               }
             })();
           }
-        } else if (msg.event === "websocket:media_start" || msg.event === "websocket:media") {
-          // CRITICAL: This is when Vonage confirms it's ready to receive audio
-          console.log(`✅ Vonage ${msg.event} received - NOW starting audio transmission`);
-          
-          if (!vonageMediaReady) {
-            vonageMediaReady = true;
-            
-            // NOW start sending audio
-            if (audioQueue.length > 0) {
-              console.log(`🎵 Starting audio sender with ${audioQueue.length} packets`);
-              startAudioSender();
-            } else {
-              // Start with silence to keep connection alive
-              console.log(`🎵 Starting audio sender with silence (waiting for buffered audio)`);
-              startAudioSender();
-            }
-          }
+        } else if (msg.event === "websocket:media:update") {
+          // Media state changed (active true/false)
+          console.log(`📋 Vonage media update: active=${msg.active}`);
         } else {
           // Log any other unknown events
           console.log(`📋 Unknown Vonage event: ${msg.event}`);
@@ -861,11 +853,43 @@ wss.on("connection", async (vonageWS, request) => {
     console.error("❌ Error stack:", error.stack);
     console.log(`🔍 DEBUG: Error occurred, WebSocket state: ${vonageWS.readyState}`);
     console.log(`🔍 DEBUG: Packets sent so far: ${audioPacketCount}, queue length: ${audioQueue.length}`);
+    console.log(`🔍 DEBUG: vonageConnected: ${vonageConnected}, vonageMediaReady: ${vonageMediaReady}`);
+    console.log(`🔍 DEBUG: Session attached: ${currentSession ? 'yes' : 'no'}, Session ready: ${currentSession?.ready || 'n/a'}`);
   });
 
   vonageWS.on("close", async (code, reason) => {
-    console.log(`📞 Vonage connection closed - Code: ${code}, Reason: ${reason || 'none'}`);
-    console.log(`🔍 DEBUG: Close triggered after ${audioPacketCount} packets sent, ${audioQueue.length} still queued`);
+    const reasonStr = reason ? reason.toString() : 'none';
+    console.log(`📞 Vonage connection CLOSED`);
+    console.log(`🔍 Close Code: ${code}`);
+    console.log(`🔍 Close Reason: ${reasonStr}`);
+    console.log(`🔍 Packets sent: ${audioPacketCount}`);
+    console.log(`🔍 Packets queued: ${audioQueue.length}`);
+    console.log(`🔍 Call duration: ${Math.floor((Date.now() - callStartTime) / 1000)}s`);
+    console.log(`🔍 vonageConnected: ${vonageConnected}, vonageMediaReady: ${vonageMediaReady}`);
+    
+    // Decode close code for debugging
+    const closeCodeMeaning = {
+      1000: 'Normal closure',
+      1001: 'Going away',
+      1002: 'Protocol error',
+      1003: 'Unsupported data',
+      1006: 'Abnormal closure (no close frame)',
+      1007: 'Invalid frame payload',
+      1008: 'Policy violation',
+      1009: 'Message too big',
+      1010: 'Missing extension',
+      1011: 'Internal server error',
+      1015: 'TLS handshake failure'
+    };
+    console.log(`🔍 Close code meaning: ${closeCodeMeaning[code] || 'Unknown'}`);
+    
+    if (code === 1002) {
+      console.error('⚠️ PROTOCOL ERROR - Vonage rejected our WebSocket protocol!');
+      console.error('⚠️ Possible causes: invalid binary frame format, incorrect audio format, or missing handshake');
+    } else if (code === 1003) {
+      console.error('⚠️ UNSUPPORTED DATA - Vonage rejected our audio data format!');
+      console.error('⚠️ Check: audio must be 16kHz PCM16 mono, 640 bytes per frame');
+    }
     
     // Clean up audio sender
     if (audioSender) {
