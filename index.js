@@ -618,11 +618,7 @@ wss.on("connection", async (vonageWS, request) => {
     // Save remaining bytes for next call
     leftoverBytes = combined.slice(offset);
     
-    // Start sender if not already running, we have packets, AND Vonage is connected
-    if (!audioSender && audioQueue.length > 0 && vonageConnected) {
-      console.log(`🎵 Auto-starting audio sender (${audioQueue.length} packets queued)`);
-      startAudioSender();
-    }
+    // Don't auto-start here - let the delayed start after websocket:connected handle it
   };
   
   const startAudioSender = () => {
