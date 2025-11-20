@@ -568,6 +568,7 @@ wss.on("connection", async (vonageWS, request) => {
   let keepAliveInterval = null;
   let firstAudioReceived = false;
   let vonageStreamReady = false;
+  let vonageConnected = false; // Track if Vonage sent websocket:connected
   let currentSession = null; // Will hold PrewarmedSession instance
   let lastAudioSent = 0; // Timestamp of last audio packet sent
   
@@ -617,8 +618,8 @@ wss.on("connection", async (vonageWS, request) => {
     // Save remaining bytes for next call
     leftoverBytes = combined.slice(offset);
     
-    // Start sender if not already running and we have packets
-    if (!audioSender && audioQueue.length > 0) {
+    // Start sender if not already running, we have packets, AND Vonage is connected
+    if (!audioSender && audioQueue.length > 0 && vonageConnected) {
       console.log(`🎵 Auto-starting audio sender (${audioQueue.length} packets queued)`);
       startAudioSender();
     }
@@ -733,6 +734,7 @@ wss.on("connection", async (vonageWS, request) => {
         
         if (msg.event === "websocket:connected") {
           console.log("📞 Vonage websocket:connected, content-type:", msg['content-type']);
+          vonageConnected = true; // Mark as connected
           console.log("✅ Vonage WebSocket connected");
           
           // Acquire session first
