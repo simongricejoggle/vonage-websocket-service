@@ -731,6 +731,7 @@ wss.on("connection", async (vonageWS, request) => {
       if (rawString[0] === '{') {
         const msg = JSON.parse(rawString);
         console.log(`📋 Vonage event: ${msg.event}`);
+        console.log(`📋 Full Vonage message:`, JSON.stringify(msg));
         
         if (msg.event === "websocket:connected") {
           console.log("📞 Vonage websocket:connected, content-type:", msg['content-type']);
