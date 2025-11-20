@@ -752,11 +752,12 @@ wss.on("connection", async (vonageWS, request) => {
             event: "websocket:media_ready"
           };
           vonageWS.send(JSON.stringify(mediaReadyResponse));
-          console.log("✅ Sent websocket:media_ready acknowledgement - waiting for media_start...");
+          console.log("✅ Sent websocket:media_ready acknowledgement");
           
           vonageConnected = true; // Mark as connected
+          vonageMediaReady = true; // Assume media is ready after we send media_ready
           
-          // Acquire session first (but don't start audio sender yet)
+          // Acquire session first
           if (prewarmPool.has(conversationId)) {
             // FAST PATH: Pre-warmed session (synchronous)
             const poolData = prewarmPool.get(conversationId);
@@ -766,11 +767,19 @@ wss.on("connection", async (vonageWS, request) => {
             console.log(`✅ Session acquired and ready for ${conversationId}`);
             
             // Attach immediately (this will queue audio)
-            console.log("🎬 Attaching session (audio will queue until Vonage media_start)...");
+            console.log("🎬 Attaching session and queueing audio...");
             currentSession.attachToVonage(sendVonageAudio, onFirstAudio);
-            console.log(`📦 Audio queued: ${audioQueue.length} packets waiting for Vonage media_start`);
+            console.log(`📦 Audio queued: ${audioQueue.length} packets`);
             
-            // DON'T start audio sender yet - wait for websocket:media_start from Vonage
+            // Start audio sender immediately to keep connection alive
+            if (audioQueue.length > 0) {
+              console.log(`🎵 Starting audio sender with ${audioQueue.length} packets`);
+              startAudioSender();
+            } else {
+              // Send silence to keep connection alive while waiting for buffered audio
+              console.log(`🎵 Starting audio sender with silence (audio buffering...)`);
+              startAudioSender();
+            }
           } else {
             // SLOW PATH: Create new session (async)
             console.log(`⚠️ No pre-warmed session - creating new session for ${conversationId}`);
@@ -783,25 +792,27 @@ wss.on("connection", async (vonageWS, request) => {
                 
                 // Attach once ready (audio will queue)
                 currentSession.attachToVonage(sendVonageAudio, onFirstAudio);
-                console.log(`📦 Audio queued: ${audioQueue.length} packets waiting for Vonage media_start`);
+                console.log(`📦 Audio queued: ${audioQueue.length} packets`);
                 
-                // DON'T start audio sender yet - wait for websocket:media_start from Vonage
+                // Start audio sender immediately
+                if (audioQueue.length > 0) {
+                  console.log(`🎵 Starting audio sender with ${audioQueue.length} packets`);
+                  startAudioSender();
+                } else {
+                  console.log(`🎵 Starting audio sender with silence`);
+                  startAudioSender();
+                }
               } catch (error) {
                 console.error(`❌ Failed to create session: ${error.message}`);
               }
             })();
           }
         } else if (msg.event === "websocket:media_start" || msg.event === "websocket:media") {
-          // Vonage confirms media stream is ready - NOW we can send audio
-          console.log(`✅ Vonage media_start received - starting audio transmission`);
-          vonageMediaReady = true;
-          
-          if (audioQueue.length > 0) {
-            console.log(`🎵 Starting audio sender with ${audioQueue.length} packets queued`);
-            startAudioSender();
-          } else {
-            console.log("⚠️ No audio queued - sender will auto-start when audio arrives");
-          }
+          // Optional: Vonage may send media_start (log it for debugging)
+          console.log(`📋 Vonage ${msg.event} received (optional acknowledgement)`);
+        } else {
+          // Log any other unknown events
+          console.log(`📋 Unknown Vonage event: ${msg.event}`);
         }
       } else {
         // This is binary audio data (640 bytes of L16 PCM)
