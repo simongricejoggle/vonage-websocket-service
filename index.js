@@ -221,6 +221,7 @@ class PrewarmedSession {
       console.log(`✅ OpenAI connected for session ${this.conversationId}`);
       
       // Send initial session config - beta partial update
+      // CRITICAL: Start with turn_detection=null so user speech doesn't interrupt greeting
       const sessionConfig = {
         type: "session.update",
         session: {
@@ -229,13 +230,7 @@ class PrewarmedSession {
           voice: "ash",
           input_audio_format: "pcm16",
           output_audio_format: "pcm16",
-          turn_detection: {
-            type: "server_vad",
-            threshold: 0.5,
-            prefix_padding_ms: 300,
-            silence_duration_ms: 700,
-            create_response: true
-          },
+          turn_detection: null, // Disabled during greeting
           temperature: 0.8
         }
       };
@@ -298,6 +293,21 @@ class PrewarmedSession {
           if (this.greetingResponseId && evt.response.id === this.greetingResponseId) {
             this.greetingComplete = true;
             console.log(`🎉 Greeting complete in session ${this.conversationId}`);
+            
+            // Enable turn detection NOW (greeting won't be interrupted)
+            console.log(`🎤 Enabling turn detection for conversation...`);
+            this.ws.send(JSON.stringify({
+              type: "session.update",
+              session: {
+                turn_detection: {
+                  type: "server_vad",
+                  threshold: 0.5,
+                  prefix_padding_ms: 300,
+                  silence_duration_ms: 700,
+                  create_response: true
+                }
+              }
+            }));
             
             // Apply full knowledge if loaded
             if (this.fullInstructions) {
