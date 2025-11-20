@@ -636,7 +636,27 @@ wss.on("connection", async (vonageWS, request) => {
     
     const silenceBuffer = Buffer.alloc(640, 0);
     
-    // Send at 50 packets/sec (one every 20ms)
+    // CRITICAL: Send first packet IMMEDIATELY (don't wait for interval)
+    // Vonage may expect immediate audio transmission after media_ready
+    console.log(`🚀 Sending first packet immediately (${audioQueue.length} queued)`);
+    try {
+      if (audioQueue.length > 0) {
+        const firstChunk = audioQueue.shift();
+        vonageWS.send(firstChunk);
+        audioPacketCount++;
+        lastAudioSent = Date.now();
+        console.log(`✅ Sent first packet immediately (640 bytes, ${audioQueue.length} remaining)`);
+      } else {
+        vonageWS.send(silenceBuffer);
+        lastAudioSent = Date.now();
+        console.log(`✅ Sent silence packet immediately (no audio queued yet)`);
+      }
+    } catch (error) {
+      console.error(`❌ Failed to send initial packet:`, error.message);
+      return;
+    }
+    
+    // Then continue at 50 packets/sec (one every 20ms)
     audioSender = setInterval(() => {
       try {
         // Check if WebSocket is still open
