@@ -794,19 +794,10 @@ wss.on("connection", async (vonageWS, request) => {
             currentSession.attachToVonage(sendVonageAudio, onFirstAudio);
             console.log(`📦 Audio queued: ${audioQueue.length} packets`);
             
-            // Send all queued audio immediately in one burst, then start interval
-            console.log("🚀 Sending all queued audio immediately...");
-            while (audioQueue.length > 0 && vonageWS.readyState === WebSocket.OPEN) {
-              const chunk = audioQueue.shift();
-              vonageWS.send(chunk);
-              audioPacketCount++;
-            }
-            console.log(`✅ Sent ${audioPacketCount} packets immediately`);
-            
-            // Now start interval for ongoing audio
-            if (vonageWS.readyState === WebSocket.OPEN) {
-              startAudioSender();
-            }
+            // Start paced audio sender (sends at 50pps = 20ms intervals)
+            // This handles ALL audio including buffered greeting
+            console.log("🎵 Starting paced audio sender (50pps)...");
+            startAudioSender();
           } else {
             // SLOW PATH: Create new session (async)
             console.log(`⚠️ No pre-warmed session - creating new session for ${conversationId}`);
@@ -821,19 +812,9 @@ wss.on("connection", async (vonageWS, request) => {
                 currentSession.attachToVonage(sendVonageAudio, onFirstAudio);
                 console.log(`📦 Audio queued: ${audioQueue.length} packets`);
                 
-                // Send all queued audio immediately
-                console.log("🚀 Sending all queued audio immediately...");
-                while (audioQueue.length > 0 && vonageWS.readyState === WebSocket.OPEN) {
-                  const chunk = audioQueue.shift();
-                  vonageWS.send(chunk);
-                  audioPacketCount++;
-                }
-                console.log(`✅ Sent ${audioPacketCount} packets immediately`);
-                
-                // Now start interval for ongoing audio
-                if (vonageWS.readyState === WebSocket.OPEN) {
-                  startAudioSender();
-                }
+                // Start paced audio sender (50pps)
+                console.log("🎵 Starting paced audio sender (50pps)...");
+                startAudioSender();
               } catch (error) {
                 console.error(`❌ Failed to create session: ${error.message}`);
               }
