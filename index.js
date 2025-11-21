@@ -791,45 +791,49 @@ wss.on("connection", async (vonageWS, request) => {
           vonageConnected = true;
           vonageMediaReady = true;
           
-          // Acquire session and attach - audio will queue during attachment
-          if (prewarmPool.has(conversationId)) {
-            const poolData = prewarmPool.get(conversationId);
-            prewarmPool.delete(conversationId);
-            currentSession = poolData.session;
-            console.log(`🎯 Using pre-warmed session for ${conversationId}`);
-            console.log(`✅ Session acquired and ready for ${conversationId}`);
-            
-            // Attach session (this queues buffered audio from greeting)
-            console.log("🎬 Attaching session and flushing buffered audio...");
-            currentSession.attachToVonage(sendVonageAudio, onFirstAudio);
-            console.log(`📦 Audio queued: ${audioQueue.length} packets`);
-            
-            // Start paced audio sender (sends at 50pps = 20ms intervals)
-            // This handles ALL audio including buffered greeting
-            console.log("🎵 Starting paced audio sender (50pps)...");
-            startAudioSender();
-          } else {
-            // SLOW PATH: Create new session (async)
-            console.log(`⚠️ No pre-warmed session - creating new session for ${conversationId}`);
-            (async () => {
-              try {
-                const session = new PrewarmedSession(conversationId, businessId);
-                await session.initialize();
-                currentSession = session;
-                console.log(`✅ New session ready for ${conversationId}`);
-                
-                // Attach once ready (audio will queue)
-                currentSession.attachToVonage(sendVonageAudio, onFirstAudio);
-                console.log(`📦 Audio queued: ${audioQueue.length} packets`);
-                
-                // Start paced audio sender (50pps)
-                console.log("🎵 Starting paced audio sender (50pps)...");
-                startAudioSender();
-              } catch (error) {
-                console.error(`❌ Failed to create session: ${error.message}`);
-              }
-            })();
-          }
+          // CRITICAL: Defer audio transmission until AFTER this event handler completes
+          // This allows Vonage to process our media_ready acknowledgement first
+          setImmediate(() => {
+            // Acquire session and attach - audio will queue during attachment
+            if (prewarmPool.has(conversationId)) {
+              const poolData = prewarmPool.get(conversationId);
+              prewarmPool.delete(conversationId);
+              currentSession = poolData.session;
+              console.log(`🎯 Using pre-warmed session for ${conversationId}`);
+              console.log(`✅ Session acquired and ready for ${conversationId}`);
+              
+              // Attach session (this queues buffered audio from greeting)
+              console.log("🎬 Attaching session and flushing buffered audio...");
+              currentSession.attachToVonage(sendVonageAudio, onFirstAudio);
+              console.log(`📦 Audio queued: ${audioQueue.length} packets`);
+              
+              // Start paced audio sender (sends at 50pps = 20ms intervals)
+              // This handles ALL audio including buffered greeting
+              console.log("🎵 Starting paced audio sender (50pps)...");
+              startAudioSender();
+            } else {
+              // SLOW PATH: Create new session (async)
+              console.log(`⚠️ No pre-warmed session - creating new session for ${conversationId}`);
+              (async () => {
+                try {
+                  const session = new PrewarmedSession(conversationId, businessId);
+                  await session.initialize();
+                  currentSession = session;
+                  console.log(`✅ New session ready for ${conversationId}`);
+                  
+                  // Attach once ready (audio will queue)
+                  currentSession.attachToVonage(sendVonageAudio, onFirstAudio);
+                  console.log(`📦 Audio queued: ${audioQueue.length} packets`);
+                  
+                  // Start paced audio sender (50pps)
+                  console.log("🎵 Starting paced audio sender (50pps)...");
+                  startAudioSender();
+                } catch (error) {
+                  console.error(`❌ Failed to create session: ${error.message}`);
+                }
+              })();
+            }
+          });
         } else if (msg.event === "websocket:media:update") {
           // Media state changed (active true/false)
           console.log(`📋 Vonage media update: active=${msg.active}`);
