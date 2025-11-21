@@ -653,11 +653,13 @@ wss.on("connection", async (vonageWS, request) => {
       try {
         if (audioQueue.length > 0) {
           const firstChunk = audioQueue.shift();
+          // Vonage expects raw binary audio (640-byte PCM16 buffers)
           vonageWS.send(firstChunk);
           audioPacketCount++;
           lastAudioSent = Date.now();
           console.log(`✅ Sent first packet immediately (640 bytes, ${audioQueue.length} remaining)`);
         } else {
+          // Send silence as raw binary
           vonageWS.send(silenceBuffer);
           lastAudioSent = Date.now();
           console.log(`✅ Sent silence packet immediately (no audio queued yet)`);
@@ -692,6 +694,7 @@ wss.on("connection", async (vonageWS, request) => {
           
           // Send with error handling to catch protocol violations
           try {
+            // Vonage expects raw binary audio (640-byte PCM16 buffers)
             vonageWS.send(chunk);
             audioPacketCount++;
             lastAudioSent = Date.now();
@@ -714,7 +717,7 @@ wss.on("connection", async (vonageWS, request) => {
             console.log(`📤 Sent audio packet #${audioPacketCount} to Vonage (${audioQueue.length} queued, hasAudio: ${hasAudio})`);
           }
         } else {
-          // Send silence to keep connection alive
+          // Send silence to keep connection alive (raw binary)
           vonageWS.send(silenceBuffer);
           lastAudioSent = Date.now();
         }
@@ -781,21 +784,14 @@ wss.on("connection", async (vonageWS, request) => {
         if (msg.event === "websocket:connected") {
           console.log("📞 Vonage websocket:connected, content-type:", msg['content-type']);
           
-          // Send media_ready acknowledgement (may be required by Vonage)
-          const mediaReadyResponse = {
-            event: "websocket:media_ready"
-          };
-          vonageWS.send(JSON.stringify(mediaReadyResponse));
-          console.log("✅ Sent websocket:media_ready acknowledgement");
+          // Vonage docs: No acknowledgement required for websocket:connected
+          // Simply being ready to receive/send audio is sufficient
           
           vonageConnected = true;
           vonageMediaReady = true;
           
-          // CRITICAL: Defer audio transmission until AFTER this event handler completes
-          // This allows Vonage to process our media_ready acknowledgement first
-          setImmediate(() => {
-            // Acquire session and attach - audio will queue during attachment
-            if (prewarmPool.has(conversationId)) {
+          // Acquire session and attach - audio will queue during attachment
+          if (prewarmPool.has(conversationId)) {
               const poolData = prewarmPool.get(conversationId);
               prewarmPool.delete(conversationId);
               currentSession = poolData.session;
@@ -833,7 +829,6 @@ wss.on("connection", async (vonageWS, request) => {
                 }
               })();
             }
-          });
         } else if (msg.event === "websocket:media:update") {
           // Media state changed (active true/false)
           console.log(`📋 Vonage media update: active=${msg.active}`);
