@@ -784,13 +784,9 @@ wss.on("connection", async (vonageWS, request) => {
         if (msg.event === "websocket:connected") {
           console.log("📞 Vonage websocket:connected, content-type:", msg['content-type']);
           
-          // Vonage docs: No acknowledgement required for websocket:connected
-          // Simply being ready to receive/send audio is sufficient
-          
           vonageConnected = true;
           
-          // Acquire session and attach - audio will queue during attachment
-          // BUT don't start sending yet - wait for websocket:media_start
+          // Acquire session and attach
           if (prewarmPool.has(conversationId)) {
               const poolData = prewarmPool.get(conversationId);
               prewarmPool.delete(conversationId);
@@ -799,10 +795,16 @@ wss.on("connection", async (vonageWS, request) => {
               console.log(`✅ Session acquired and ready for ${conversationId}`);
               
               // Attach session (this queues buffered audio from greeting)
-              console.log("🎬 Attaching session (audio buffering)...");
+              console.log("🎬 Attaching session and flushing buffered audio...");
               currentSession.attachToVonage(sendVonageAudio, onFirstAudio);
               console.log(`📦 Audio queued: ${audioQueue.length} packets`);
-              console.log(`⏳ Waiting for websocket:media_start before sending audio...`);
+              
+              // CRITICAL FIX: Vonage doesn't send media_start event
+              // According to official docs, after websocket:connected, audio flow begins immediately
+              // Start sending audio RIGHT NOW
+              console.log("🎵 Starting paced audio sender (50pps)...");
+              startAudioSender();
+              vonageMediaReady = true;
             } else {
               // SLOW PATH: Create new session (async)
               console.log(`⚠️ No pre-warmed session - creating new session for ${conversationId}`);
@@ -813,29 +815,23 @@ wss.on("connection", async (vonageWS, request) => {
                   currentSession = session;
                   console.log(`✅ New session ready for ${conversationId}`);
                   
-                  // Attach once ready (audio will queue)
+                  // Attach once ready and start audio
                   currentSession.attachToVonage(sendVonageAudio, onFirstAudio);
                   console.log(`📦 Audio queued: ${audioQueue.length} packets`);
-                  console.log(`⏳ Waiting for websocket:media_start before sending audio...`);
+                  console.log("🎵 Starting paced audio sender (50pps)...");
+                  startAudioSender();
+                  vonageMediaReady = true;
                 } catch (error) {
                   console.error(`❌ Failed to create session: ${error.message}`);
                 }
               })();
             }
-        } else if (msg.event === "websocket:media_start" || msg.event === "media:start") {
-          // Vonage is ready to receive audio - NOW we can start sending
-          console.log("🎬 Vonage media_start received - starting audio transmission");
-          console.log(`📋 Media start details:`, JSON.stringify(msg));
-          
-          vonageMediaReady = true;
-          
-          // Start paced audio sender (sends at 50pps = 20ms intervals)
-          // This handles ALL audio including buffered greeting
-          console.log("🎵 Starting paced audio sender (50pps)...");
-          startAudioSender();
-        } else if (msg.event === "websocket:media:update") {
-          // Media state changed (active true/false)
-          console.log(`📋 Vonage media update: active=${msg.active}`);
+        } else if (msg.event === "websocket:cleared") {
+          // Response to clear command - buffer was cleared
+          console.log("📋 Vonage buffer cleared");
+        } else if (msg.event === "websocket:notify") {
+          // Response to notify command - audio playback finished
+          console.log(`📋 Vonage notify event:`, JSON.stringify(msg));
         } else {
           // Log any other unknown events
           console.log(`📋 Unknown Vonage event: ${msg.event}`);
