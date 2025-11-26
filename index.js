@@ -156,6 +156,7 @@ class PrewarmedSession {
     this.attached = false;
     this.audioBuffer = []; // Buffer audio deltas until Vonage attaches
     this.sendToVonage = null; // Callback to send audio to Vonage
+    this.onInterruption = null; // Callback for interruption
     this.greetingResponseId = null;
     this.greetingComplete = false;
     this.isAiSpeaking = false;
@@ -265,6 +266,18 @@ class PrewarmedSession {
         if (evt.type === 'response.output_item.added') {
           this.isAiSpeaking = true;
           console.log(`🔊 AI speaking in session ${this.conversationId}`);
+        }
+
+        // Handle interruption: Clear buffer when user starts speaking
+        if (evt.type === 'input_audio_buffer.speech_started') {
+          console.log(`🗣️ User started speaking in session ${this.conversationId} - clearing audio buffer`);
+          // We need to clear the audio queue in the main connection handler
+          // This is tricky because 'audioQueue' is defined in the connection handler scope,
+          // but this event handler is in the PrewarmedSession class.
+          // We can trigger a callback if one is registered.
+          if (this.onInterruption) {
+            this.onInterruption();
+          }
         }
 
         // CRITICAL: Buffer audio deltas until Vonage attaches
@@ -408,7 +421,7 @@ class PrewarmedSession {
   }
 
   // Attach to Vonage call - provide callback to send audio
-  attachToVonage(sendAudioCallback, onFirstAudioCallback = null) {
+  attachToVonage(sendAudioCallback, onFirstAudioCallback = null, onInterruptionCallback = null) {
     if (this.attached) {
       console.warn(`⚠️ Session ${this.conversationId} already attached`);
       return;
@@ -417,6 +430,7 @@ class PrewarmedSession {
     this.attached = true;
     this.sendToVonage = sendAudioCallback;
     this.onFirstAudio = onFirstAudioCallback;
+    this.onInterruption = onInterruptionCallback;
     console.log(`🔌 Vonage attached to session ${this.conversationId}`);
 
     // Flush buffered audio - sends immediately to Vonage
@@ -796,14 +810,19 @@ wss.on("connection", async (vonageWS, request) => {
 
             // Attach session (this queues buffered audio from greeting)
             console.log("🎬 Attaching session and flushing buffered audio...");
-            currentSession.attachToVonage(sendVonageAudio, onFirstAudio);
+            currentSession.attachToVonage(sendVonageAudio, onFirstAudio, () => {
+              // Interruption handler
+              console.log(`🛑 Interruption detected - clearing ${audioQueue.length} queued packets`);
+              audioQueue.length = 0;
+              leftoverBytes = Buffer.alloc(0);
+            });
             console.log(`📦 Audio queued: ${audioQueue.length} packets`);
 
             // CRITICAL FIX: Vonage doesn't send media_start event
             // According to official docs, after websocket:connected, audio flow begins immediately
-            // Start sending audio with a small delay to ensure connection stability
-            console.log("🎵 Starting paced audio sender (50pps) in 200ms...");
-            setTimeout(startAudioSender, 200);
+            // Start sending audio with a minimal delay to ensure connection stability
+            console.log("🎵 Starting paced audio sender (50pps) in 50ms...");
+            setTimeout(startAudioSender, 50);
             vonageMediaReady = true;
           } else {
             // SLOW PATH: Create new session (async)
@@ -816,10 +835,15 @@ wss.on("connection", async (vonageWS, request) => {
                 console.log(`✅ New session ready for ${conversationId}`);
 
                 // Attach once ready and start audio
-                currentSession.attachToVonage(sendVonageAudio, onFirstAudio);
+                currentSession.attachToVonage(sendVonageAudio, onFirstAudio, () => {
+                  // Interruption handler
+                  console.log(`🛑 Interruption detected - clearing ${audioQueue.length} queued packets`);
+                  audioQueue.length = 0;
+                  leftoverBytes = Buffer.alloc(0);
+                });
                 console.log(`📦 Audio queued: ${audioQueue.length} packets`);
-                console.log("🎵 Starting paced audio sender (50pps) in 200ms...");
-                setTimeout(startAudioSender, 200);
+                console.log("🎵 Starting paced audio sender (50pps) in 50ms...");
+                setTimeout(startAudioSender, 50);
                 vonageMediaReady = true;
               } catch (error) {
                 console.error(`❌ Failed to create session: ${error.message}`);
@@ -943,6 +967,8 @@ wss.on("connection", async (vonageWS, request) => {
 function getBusinessInstructions(bizId) {
   const profiles = {
     wethreeloggerheads: `You are Joggle for We Three Loggerheads pub. Your PRIMARY GOAL: Understand exactly what the customer needs and help them.
+
+LANGUAGE: You must speak ONLY in English. If you hear background noise or unclear speech, ignore it or ask the user to repeat themselves in English. Do not switch to Welsh or other languages even if you think you hear them.
 
 APPROACH:
 1. Listen carefully and let customers explain what they want
