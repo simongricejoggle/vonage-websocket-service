@@ -302,7 +302,7 @@ wss.on("connection", async (vonageWS, request) => {
     sendOpenAI({
       type: "response.create",
       response: {
-        modalities: ["audio"],
+        modalities: ["audio", "text"],
         instructions: "Please say exactly: \"" + config.greeting + "\"",
       },
     });
