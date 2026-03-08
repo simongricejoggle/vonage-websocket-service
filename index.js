@@ -395,9 +395,7 @@ wss.on("connection", async (vonageWS, request) => {
     }
 
     try {
-      if (audioPacketsSent === 0) {
-        stopSilenceKeepAlive();
-      }
+      stopSilenceKeepAlive(); // Stop silence whenever real audio arrives (greeting or response)
       const audio16kBase64 = resample24kTo16k(base64Audio24k);
       const audio16kBuf = Buffer.from(audio16kBase64, "base64");
       vonageWS.send(audio16kBuf);
@@ -530,6 +528,7 @@ wss.on("connection", async (vonageWS, request) => {
                 console.log("[CALL] Greeting complete (pre-generated) — enabling VAD");
                 enableVAD(openaiWS);
                 flushCallerAudioBuffer();
+                startSilenceKeepAlive(); // Hold line open while waiting for caller to speak
               }
               // If greeting was still streaming when call arrived, response.done will fire
               // normally through attachOpenAIHandlers and complete the flow
@@ -554,6 +553,7 @@ wss.on("connection", async (vonageWS, request) => {
                 if (greetingTimeoutId) { clearTimeout(greetingTimeoutId); greetingTimeoutId = null; }
                 enableVAD(openaiWS);
                 flushCallerAudioBuffer();
+                startSilenceKeepAlive(); // Hold line open while waiting for caller to speak
               };
               // If greeting somehow already marked done but buffer was cleared, handle it
               if (acquiredPrewarm.greetingBufferReady) {
@@ -654,6 +654,7 @@ wss.on("connection", async (vonageWS, request) => {
               console.log("[CALL] Greeting complete — enabling VAD and flushing caller audio");
               enableVAD(openaiWS);
               flushCallerAudioBuffer();
+              startSilenceKeepAlive(); // Hold line open while waiting for caller to speak
             }
           }
         }
