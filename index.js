@@ -258,6 +258,10 @@ function prewarmGreeting(session) {
         if (session.greetingAudioBuffer.length === 1) {
           console.log("[PREWARM] First greeting audio chunk buffered");
         }
+        // If Vonage already connected while we were generating, pipe directly
+        if (session.onGreetingChunk) {
+          session.onGreetingChunk(evt.delta);
+        }
       }
 
       // Greeting generation complete
@@ -267,6 +271,9 @@ function prewarmGreeting(session) {
           session.greetingBufferReady = true;
           console.log("[PREWARM] Greeting ready — " + session.greetingAudioBuffer.length + " chunks pre-buffered");
           openaiWS.removeListener("message", onMessage);
+          if (session.onGreetingDone) {
+            session.onGreetingDone();
+          }
         }
       }
 
@@ -522,8 +529,33 @@ wss.on("connection", async (vonageWS, request) => {
               }
               // If greeting was still streaming when call arrived, response.done will fire
               // normally through attachOpenAIHandlers and complete the flow
+            } else if (acquiredPrewarm) {
+              // Prewarm session is ready but greeting still generating — pipe chunks directly as they arrive
+              console.log("[CALL] Greeting in-flight — piping to caller as generated");
+              greetingSent = true;
+              greetingAudioReceived = true;
+              if (acquiredPrewarm.greetingResponseId) {
+                greetingResponseId = acquiredPrewarm.greetingResponseId;
+              }
+              acquiredPrewarm.onGreetingChunk = (delta) => {
+                sendVonageAudio(delta);
+              };
+              acquiredPrewarm.onGreetingDone = () => {
+                greetingDone = true;
+                console.log("[CALL] Greeting complete (piped) — enabling VAD");
+                if (greetingTimeoutId) { clearTimeout(greetingTimeoutId); greetingTimeoutId = null; }
+                enableVAD(openaiWS);
+                flushCallerAudioBuffer();
+              };
+              // If greeting somehow already marked done but buffer was cleared, handle it
+              if (acquiredPrewarm.greetingBufferReady) {
+                greetingDone = true;
+                enableVAD(openaiWS);
+              } else {
+                startSilenceKeepAlive(); // Safety net — first audio chunk will call stopSilenceKeepAlive()
+              }
             } else {
-              // ⚡ Fallback: greeting not buffered yet — use silence keep-alive while OpenAI generates
+              // ⚡ No prewarm at all — cold start greeting
               startSilenceKeepAlive();
               trySendGreeting();
             }
