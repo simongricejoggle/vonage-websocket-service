@@ -236,7 +236,6 @@ wss.on("connection", async (vonageWS, request) => {
   console.log("[CALL] New: biz=" + businessId + " conv=" + conversationId + " from=" + fromNumber);
 
   let openaiWS = null;
-  let streamId = "";
   let greetingSent = false;
   let vonageStreamReady = false;
   let openaiReady = false;
@@ -271,15 +270,12 @@ wss.on("connection", async (vonageWS, request) => {
   };
 
   const sendVonageAudio = (base64Audio24k) => {
-    if (vonageWS.readyState !== WebSocket.OPEN || !streamId) return;
+    if (vonageWS.readyState !== WebSocket.OPEN || !vonageStreamReady) return;
 
     try {
-      const audio16k = resample24kTo16k(base64Audio24k);
-      vonageWS.send(JSON.stringify({
-        event: "media",
-        stream_id: streamId,
-        media: { payload: audio16k },
-      }));
+      const audio16kBase64 = resample24kTo16k(base64Audio24k);
+      const audio16kBuf = Buffer.from(audio16kBase64, "base64");
+      vonageWS.send(audio16kBuf);
       audioPacketsSent++;
       if (audioPacketsSent === 1) {
         console.log("[CALL] First audio packet sent to caller");
@@ -322,42 +318,41 @@ wss.on("connection", async (vonageWS, request) => {
   };
 
   // Handle Vonage messages
+  // Vonage sends JSON control events as text frames, raw binary PCM16 as binary frames
   vonageWS.on("message", (data) => {
     try {
-      if (typeof data !== "string" && !Buffer.isBuffer(data)) return;
-      const str = data.toString();
-      if (!str.startsWith("{")) return;
-      const msg = JSON.parse(str);
+      const isBuffer = Buffer.isBuffer(data);
 
-      if (msg.event === "connected" || msg.event === "websocket:connected") {
-        console.log("[CALL] Vonage connected");
-      }
+      if (!isBuffer) {
+        // JSON control message
+        const str = data.toString();
+        if (!str.startsWith("{")) return;
+        const msg = JSON.parse(str);
 
-      if (msg.event === "start") {
-        streamId = msg.stream_id;
-        console.log("[CALL] Stream started: " + streamId);
-        vonageStreamReady = true;
-        trySendGreeting();
-      }
-
-      if (msg.event === "media" && msg.media && msg.media.payload) {
+        if (msg.event === "websocket:connected") {
+          console.log("[CALL] Vonage websocket:connected");
+          vonageStreamReady = true;
+          trySendGreeting();
+        } else if (msg.event === "websocket:cleared" || msg.event === "websocket:notify") {
+          // Acknowledgement events — no action needed
+        } else {
+          console.log("[CALL] Vonage event: " + msg.event);
+        }
+      } else {
+        // Raw binary PCM16 audio at 16kHz from Vonage
         audioPacketsReceived++;
         if (audioPacketsReceived === 1) {
-          console.log("[CALL] First audio from caller received");
+          console.log("[CALL] First audio from caller received (" + data.length + " bytes)");
         }
 
+        const base64_16k = data.toString("base64");
         if (openaiReady && openaiWS && openaiWS.readyState === WebSocket.OPEN) {
-          const audio24k = resample16kTo24k(msg.media.payload);
+          const audio24k = resample16kTo24k(base64_16k);
           sendOpenAI({ type: "input_audio_buffer.append", audio: audio24k });
         } else {
-          audioBuffer.push(msg.media.payload);
+          audioBuffer.push(base64_16k);
           if (audioBuffer.length > 500) audioBuffer.shift();
         }
-      }
-
-      if (msg.event === "stop") {
-        console.log("[CALL] Stream stopped");
-        cleanup();
       }
     } catch (e) {
       console.error("[CALL] Vonage msg error:", e.message);
