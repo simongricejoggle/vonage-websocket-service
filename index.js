@@ -225,26 +225,25 @@ function enableVAD(openaiWS) {
 
 // ── Greeting Pre-generation ──
 // Called after configureOpenAISession during prewarm.
-// Waits for session.updated, then triggers the greeting and buffers audio deltas.
+// Sends response.create immediately (OpenAI queues it after session.update).
 // By the time Vonage connects (~1-3s later), audio is ready to flush immediately.
 function prewarmGreeting(session) {
   const openaiWS = session.openaiWS;
 
+  // Send response.create immediately — OpenAI processes session.update first (queue order)
+  // Do NOT wait for session.updated event which may have already fired or arrive late
+  console.log("[PREWARM] Triggering greeting pre-generation immediately");
+  openaiWS.send(JSON.stringify({
+    type: "response.create",
+    response: {
+      modalities: ["audio", "text"],
+      instructions: "Please say exactly: \"" + session.config.greeting + "\"",
+    },
+  }));
+
   const onMessage = (raw) => {
     try {
       const evt = JSON.parse(raw.toString());
-
-      // Once session is configured, trigger the greeting
-      if (evt.type === "session.updated" && !session.greetingResponseId) {
-        console.log("[PREWARM] Session configured — triggering greeting pre-generation");
-        openaiWS.send(JSON.stringify({
-          type: "response.create",
-          response: {
-            modalities: ["audio", "text"],
-            instructions: "Please say exactly: \"" + session.config.greeting + "\"",
-          },
-        }));
-      }
 
       // Track the greeting response ID
       if (evt.type === "response.created" && !session.greetingResponseId) {
@@ -696,7 +695,12 @@ wss.on("connection", async (vonageWS, request) => {
   if (openaiReady) {
     attachOpenAIHandlers();
     flushAudioBuffer();
-    trySendGreeting();
+    // If we have a pre-warmed session, DO NOT call trySendGreeting() —
+    // the greeting is handled via the buffer flush in websocket:connected.
+    // Calling it here would send a duplicate response.create on the same connection.
+    if (!acquiredPrewarm) {
+      trySendGreeting();
+    }
   } else {
     // Check if there's an in-progress prewarm to wait for
     const inProgressPrewarm = prewarmedSessions.get(conversationId);
