@@ -25,7 +25,7 @@ if (!RELAY_KEY) {
 
 function resample16kTo24k(base64Audio) {
   const inputBuf = Buffer.from(base64Audio, "base64");
-  const sampleCount = inputBuf.length / 2;
+  const sampleCount = Math.floor(inputBuf.length / 2);
   const outputCount = Math.floor(sampleCount * 1.5);
   const output = Buffer.alloc(outputCount * 2);
 
@@ -44,7 +44,7 @@ function resample16kTo24k(base64Audio) {
 
 function resample24kTo16k(base64Audio) {
   const inputBuf = Buffer.from(base64Audio, "base64");
-  const sampleCount = inputBuf.length / 2;
+  const sampleCount = Math.floor(inputBuf.length / 2);
   const outputCount = Math.floor(sampleCount * (2 / 3));
   const output = Buffer.alloc(outputCount * 2);
 
@@ -340,6 +340,11 @@ wss.on("connection", async (vonageWS, request) => {
         }
       } else {
         // Raw binary PCM16 audio at 16kHz from Vonage
+        if (!vonageStreamReady) {
+          console.log("[CALL] Audio received before websocket:connected — setting stream ready");
+          vonageStreamReady = true;
+          trySendGreeting();
+        }
         audioPacketsReceived++;
         if (audioPacketsReceived === 1) {
           console.log("[CALL] First audio from caller received (" + data.length + " bytes)");
