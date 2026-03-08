@@ -332,6 +332,7 @@ wss.on("connection", async (vonageWS, request) => {
   const callerAudioDuringGreeting = [];
   let greetingTimeoutId = null;
   let silenceIntervalId = null;
+  let currentResponseId = null;
 
   // 20ms of silence at 16kHz PCM16 = 640 bytes of zeros (standard Vonage frame)
   const SILENCE_FRAME = Buffer.alloc(640, 0);
@@ -398,10 +399,15 @@ wss.on("connection", async (vonageWS, request) => {
       stopSilenceKeepAlive(); // Stop silence whenever real audio arrives (greeting or response)
       const audio16kBase64 = resample24kTo16k(base64Audio24k);
       const audio16kBuf = Buffer.from(audio16kBase64, "base64");
-      vonageWS.send(audio16kBuf);
-      audioPacketsSent++;
-      if (audioPacketsSent === 1) {
-        console.log("[CALL] First audio packet sent to caller");
+      // Send in 640-byte (20ms at 16kHz) chunks — the frame size Vonage expects
+      const FRAME_SIZE = 640;
+      for (let offset = 0; offset < audio16kBuf.length; offset += FRAME_SIZE) {
+        const frame = audio16kBuf.subarray(offset, offset + FRAME_SIZE);
+        vonageWS.send(frame);
+        audioPacketsSent++;
+        if (audioPacketsSent === 1) {
+          console.log("[CALL] First audio packet sent to caller (" + frame.length + " bytes)");
+        }
       }
     } catch (e) {
       console.error("[CALL] Audio send error:", e.message);
@@ -510,9 +516,9 @@ wss.on("connection", async (vonageWS, request) => {
               greetingSent = true;
               greetingAudioReceived = true;
               greetingResponseId = acquiredPrewarm.greetingResponseId;
-              // Send 5 silence frames (100ms) first to prime Vonage's audio pipeline
+              // Send 10 silence frames (200ms) first to prime Vonage's audio pipeline
               // Without this, the first audio frames are dropped before Vonage is ready
-              for (let i = 0; i < 5; i++) {
+              for (let i = 0; i < 10; i++) {
                 try { vonageWS.send(SILENCE_FRAME); } catch (e) {}
               }
               for (const delta of acquiredPrewarm.greetingAudioBuffer) {
@@ -541,7 +547,7 @@ wss.on("connection", async (vonageWS, request) => {
                 greetingResponseId = acquiredPrewarm.greetingResponseId;
               }
               // Prime Vonage's audio pipeline with silence before first audio chunk
-              for (let i = 0; i < 5; i++) {
+              for (let i = 0; i < 10; i++) {
                 try { vonageWS.send(SILENCE_FRAME); } catch (e) {}
               }
               acquiredPrewarm.onGreetingChunk = (delta) => {
@@ -630,17 +636,29 @@ wss.on("connection", async (vonageWS, request) => {
             if (greetingTimeoutId) { clearTimeout(greetingTimeoutId); greetingTimeoutId = null; }
             console.log("[CALL] First greeting audio delta received from OpenAI");
           }
-          sendVonageAudio(evt.delta);
+          // Only send audio for the current active response — drop stale chunks after barge-in
+          if (!currentResponseId || evt.response_id === currentResponseId) {
+            sendVonageAudio(evt.delta);
+          }
         }
 
-        if (evt.type === "response.created" && !greetingResponseId && greetingSent) {
-          greetingResponseId = evt.response && evt.response.id;
-          console.log("[CALL] Greeting response ID: " + greetingResponseId);
+        if (evt.type === "response.created") {
+          const newResponseId = evt.response && evt.response.id;
+          if (!greetingResponseId && greetingSent) {
+            greetingResponseId = newResponseId;
+            console.log("[CALL] Greeting response ID: " + greetingResponseId);
+          }
+          currentResponseId = newResponseId;
+          console.log("[CALL] New response started: " + newResponseId);
         }
 
         if (evt.type === "response.done") {
           const responseId = evt.response && evt.response.id;
           const responseStatus = evt.response && evt.response.status;
+          // Clear current response when it ends (cancelled, failed, or completed)
+          if (responseId === currentResponseId) {
+            currentResponseId = null;
+          }
           if (!greetingDone && (responseId === greetingResponseId || greetingResponseId === null)) {
             if (responseStatus === "cancelled" || responseStatus === "failed") {
               console.log("[CALL] Greeting response " + responseStatus + " — retrying greeting");
@@ -656,6 +674,9 @@ wss.on("connection", async (vonageWS, request) => {
               flushCallerAudioBuffer();
               startSilenceKeepAlive(); // Hold line open while waiting for caller to speak
             }
+          } else if (responseStatus !== "cancelled") {
+            // After a conversation response completes, hold the line open while caller thinks
+            startSilenceKeepAlive();
           }
         }
 
@@ -668,7 +689,14 @@ wss.on("connection", async (vonageWS, request) => {
         }
 
         if (evt.type === "input_audio_buffer.speech_started") {
-          console.log("[CALL] Caller speaking detected");
+          console.log("[CALL] Caller speaking detected — clearing Vonage audio buffer (barge-in)");
+          // Drop any in-flight audio chunks for the current response
+          currentResponseId = null;
+          // Tell Vonage to immediately discard buffered audio so the caller isn't spoken over
+          if (vonageWS.readyState === WebSocket.OPEN) {
+            try { vonageWS.send(JSON.stringify({ action: "clear" })); } catch (e) {}
+          }
+          stopSilenceKeepAlive();
         }
 
         if (evt.type === "input_audio_buffer.speech_stopped") {
