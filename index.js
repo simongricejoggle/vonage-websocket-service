@@ -259,6 +259,30 @@ wss.on("connection", async (vonageWS, request) => {
   const audioBuffer = [];
   const callerAudioDuringGreeting = [];
   let greetingTimeoutId = null;
+  let silenceIntervalId = null;
+
+  // 100ms of silence at 16kHz PCM16 = 3200 bytes of zeros
+  const SILENCE_FRAME = Buffer.alloc(3200, 0);
+
+  const startSilenceKeepAlive = () => {
+    if (silenceIntervalId) return;
+    console.log("[CALL] Starting silence keep-alive to hold Vonage connection open");
+    silenceIntervalId = setInterval(() => {
+      if (vonageWS.readyState === WebSocket.OPEN && vonageStreamReady) {
+        vonageWS.send(SILENCE_FRAME);
+      } else {
+        stopSilenceKeepAlive();
+      }
+    }, 100);
+  };
+
+  const stopSilenceKeepAlive = () => {
+    if (silenceIntervalId) {
+      clearInterval(silenceIntervalId);
+      silenceIntervalId = null;
+      console.log("[CALL] Silence keep-alive stopped");
+    }
+  };
 
   // Check for pre-warmed session
   const prewarmed = prewarmedSessions.get(conversationId);
@@ -295,6 +319,9 @@ wss.on("connection", async (vonageWS, request) => {
     }
 
     try {
+      if (audioPacketsSent === 0) {
+        stopSilenceKeepAlive();
+      }
       const audio16kBase64 = resample24kTo16k(base64Audio24k);
       const audio16kBuf = Buffer.from(audio16kBase64, "base64");
       vonageWS.send(audio16kBuf);
@@ -343,6 +370,7 @@ wss.on("connection", async (vonageWS, request) => {
   const trySendGreeting = () => {
     if (greetingSent || !vonageStreamReady || !openaiReady || !config) return;
     console.log("[CALL] Sending greeting: \"" + config.greeting + "\"");
+    startSilenceKeepAlive();
     sendGreetingRequest();
     greetingSent = true;
 
@@ -359,6 +387,7 @@ wss.on("connection", async (vonageWS, request) => {
     if (cleaned) return;
     cleaned = true;
     if (greetingTimeoutId) clearTimeout(greetingTimeoutId);
+    stopSilenceKeepAlive();
     console.log("[CALL] Cleanup: biz=" + businessId + " sent=" + audioPacketsSent + " recv=" + audioPacketsReceived);
     try { if (openaiWS) openaiWS.close(); } catch (e) {}
     try { vonageWS.close(); } catch (e) {}
