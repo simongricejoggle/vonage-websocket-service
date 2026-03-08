@@ -261,19 +261,24 @@ wss.on("connection", async (vonageWS, request) => {
   let greetingTimeoutId = null;
   let silenceIntervalId = null;
 
-  // 100ms of silence at 16kHz PCM16 = 3200 bytes of zeros
-  const SILENCE_FRAME = Buffer.alloc(3200, 0);
+  // 20ms of silence at 16kHz PCM16 = 640 bytes of zeros (standard Vonage frame)
+  const SILENCE_FRAME = Buffer.alloc(640, 0);
 
   const startSilenceKeepAlive = () => {
     if (silenceIntervalId) return;
     console.log("[CALL] Starting silence keep-alive to hold Vonage connection open");
+    // Send one silence frame immediately — don't wait for first interval tick
+    if (vonageWS.readyState === WebSocket.OPEN) {
+      try { vonageWS.send(SILENCE_FRAME); } catch (e) {}
+    }
+    // Then continue at 50 packets/sec (20ms interval)
     silenceIntervalId = setInterval(() => {
       if (vonageWS.readyState === WebSocket.OPEN && vonageStreamReady) {
-        vonageWS.send(SILENCE_FRAME);
+        try { vonageWS.send(SILENCE_FRAME); } catch (e) { stopSilenceKeepAlive(); }
       } else {
         stopSilenceKeepAlive();
       }
-    }, 100);
+    }, 20);
   };
 
   const stopSilenceKeepAlive = () => {
@@ -408,6 +413,7 @@ wss.on("connection", async (vonageWS, request) => {
         if (msg.event === "websocket:connected") {
           console.log("[CALL] Vonage websocket:connected");
           vonageStreamReady = true;
+          startSilenceKeepAlive();
           trySendGreeting();
         } else if (msg.event === "websocket:cleared" || msg.event === "websocket:notify") {
           // Acknowledgement events — no action needed
@@ -419,6 +425,7 @@ wss.on("connection", async (vonageWS, request) => {
         if (!vonageStreamReady) {
           console.log("[CALL] Audio received before websocket:connected — setting stream ready");
           vonageStreamReady = true;
+          startSilenceKeepAlive();
           trySendGreeting();
         }
         audioPacketsReceived++;
@@ -445,7 +452,10 @@ wss.on("connection", async (vonageWS, request) => {
     }
   });
 
-  vonageWS.on("close", () => { console.log("[CALL] Vonage closed"); cleanup(); });
+  vonageWS.on("close", (code, reason) => {
+    console.log("[CALL] Vonage closed code=" + code + " reason=" + (reason ? reason.toString() : "none"));
+    cleanup();
+  });
   vonageWS.on("error", (e) => { console.error("[CALL] Vonage error:", e.message); cleanup(); });
 
   // Setup OpenAI handlers
