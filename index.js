@@ -297,14 +297,11 @@ wss.on("connection", async (vonageWS, request) => {
     config = prewarmed.config;
     openaiReady = true;
     prewarmedSessions.delete(conversationId);
+  } else if (prewarmed) {
+    console.log("[CALL] Pre-warm in progress - will wait after handlers registered");
+    // Leave in map — handled after Vonage handlers are set up so silence keep-alive runs
   } else {
-    if (prewarmed) {
-      console.log("[CALL] Pre-warmed not ready, will cold start");
-      if (prewarmed.openaiWS) { try { prewarmed.openaiWS.close(); } catch (e) {} }
-      prewarmedSessions.delete(conversationId);
-    } else {
-      console.log("[CALL] No pre-warmed session, cold start");
-    }
+    console.log("[CALL] No pre-warmed session, cold start");
   }
 
   const sendOpenAI = (obj) => {
@@ -551,6 +548,31 @@ wss.on("connection", async (vonageWS, request) => {
     flushAudioBuffer();
     trySendGreeting();
   } else {
+    // Check if there's an in-progress prewarm to wait for
+    const inProgressPrewarm = prewarmedSessions.get(conversationId);
+    if (inProgressPrewarm && !inProgressPrewarm.ready) {
+      console.log("[CALL] Waiting for in-progress prewarm (up to 4s)...");
+      const waitStart = Date.now();
+      while (!inProgressPrewarm.ready && Date.now() - waitStart < 4000) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      prewarmedSessions.delete(conversationId);
+
+      if (inProgressPrewarm.ready && inProgressPrewarm.openaiWS && inProgressPrewarm.openaiWS.readyState === WebSocket.OPEN) {
+        console.log("[CALL] Prewarm completed in " + (Date.now() - waitStart) + "ms - using pre-warmed session");
+        openaiWS = inProgressPrewarm.openaiWS;
+        config = inProgressPrewarm.config;
+        openaiReady = true;
+        attachOpenAIHandlers();
+        flushAudioBuffer();
+        trySendGreeting();
+        return;
+      } else {
+        console.log("[CALL] Prewarm timed out after " + (Date.now() - waitStart) + "ms - cold starting");
+        if (inProgressPrewarm.openaiWS) { try { inProgressPrewarm.openaiWS.close(); } catch (e) {} }
+      }
+    }
+
     try {
       config = await fetchVoiceConfig(businessId);
       console.log("[CALL] Config loaded: voice=" + config.voice);
