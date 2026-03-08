@@ -512,6 +512,11 @@ wss.on("connection", async (vonageWS, request) => {
               greetingSent = true;
               greetingAudioReceived = true;
               greetingResponseId = acquiredPrewarm.greetingResponseId;
+              // Send 5 silence frames (100ms) first to prime Vonage's audio pipeline
+              // Without this, the first audio frames are dropped before Vonage is ready
+              for (let i = 0; i < 5; i++) {
+                try { vonageWS.send(SILENCE_FRAME); } catch (e) {}
+              }
               for (const delta of acquiredPrewarm.greetingAudioBuffer) {
                 sendVonageAudio(delta);
               }
@@ -535,6 +540,10 @@ wss.on("connection", async (vonageWS, request) => {
               greetingAudioReceived = true;
               if (acquiredPrewarm.greetingResponseId) {
                 greetingResponseId = acquiredPrewarm.greetingResponseId;
+              }
+              // Prime Vonage's audio pipeline with silence before first audio chunk
+              for (let i = 0; i < 5; i++) {
+                try { vonageWS.send(SILENCE_FRAME); } catch (e) {}
               }
               acquiredPrewarm.onGreetingChunk = (delta) => {
                 sendVonageAudio(delta);
