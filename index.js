@@ -198,7 +198,7 @@ function configureOpenAISession(openaiWS, config) {
       voice: baseVoice,
       input_audio_format: "pcm16",
       output_audio_format: "pcm16",
-      input_audio_transcription: { model: "whisper-1" },
+      input_audio_transcription: { model: "gpt-4o-mini-transcribe" },
       turn_detection: null,
     },
   };
@@ -222,12 +222,14 @@ function enableVAD(openaiWS) {
 async function prewarmSession(session) {
   const t0 = Date.now();
 
-  session.config = await fetchVoiceConfig(session.businessId);
-  console.log("[PREWARM] Config in " + (Date.now() - t0) + "ms");
+  const [config, openaiWS] = await Promise.all([
+    fetchVoiceConfig(session.businessId),
+    connectOpenAI(),
+  ]);
+  console.log("[PREWARM] Config+OpenAI in " + (Date.now() - t0) + "ms");
 
-  session.openaiWS = await connectOpenAI();
-  console.log("[PREWARM] OpenAI in " + (Date.now() - t0) + "ms");
-
+  session.config = config;
+  session.openaiWS = openaiWS;
   configureOpenAISession(session.openaiWS, session.config);
 
   session.ready = true;
@@ -401,23 +403,31 @@ wss.on("connection", async (vonageWS, request) => {
     try {
       const isBuffer = Buffer.isBuffer(data);
 
-      if (!isBuffer) {
-        // JSON control message
-        const str = data.toString();
-        if (!str.startsWith("{")) return;
-        const msg = JSON.parse(str);
+      // Vonage sometimes sends JSON control events as binary frames — check both
+      const possibleJson = isBuffer ? data.toString("utf8") : data.toString();
+      const looksLikeJson = possibleJson.charCodeAt(0) === 123; // '{'
+      let handledAsJson = false;
 
-        if (msg.event === "websocket:connected") {
-          console.log("[CALL] Vonage websocket:connected");
-          vonageStreamReady = true;
-          startSilenceKeepAlive();
-          trySendGreeting();
-        } else if (msg.event === "websocket:cleared" || msg.event === "websocket:notify") {
-          // Acknowledgement events — no action needed
-        } else {
-          console.log("[CALL] Vonage event: " + msg.event);
+      if (looksLikeJson) {
+        let msg;
+        try { msg = JSON.parse(possibleJson); } catch (e) { msg = null; }
+
+        if (msg && msg.event) {
+          handledAsJson = true;
+          if (msg.event === "websocket:connected") {
+            console.log("[CALL] Vonage websocket:connected (content-type: " + (msg["content-type"] || "unknown") + ")");
+            vonageStreamReady = true;
+            startSilenceKeepAlive();
+            trySendGreeting();
+          } else if (msg.event === "websocket:cleared" || msg.event === "websocket:notify") {
+            // Acknowledgement events — no action needed
+          } else {
+            console.log("[CALL] Vonage event: " + msg.event);
+          }
         }
-      } else {
+      }
+
+      if (!handledAsJson && isBuffer) {
         // Raw binary PCM16 audio at 16kHz from Vonage
         if (!vonageStreamReady) {
           console.log("[CALL] Audio received before websocket:connected — setting stream ready");
@@ -551,9 +561,9 @@ wss.on("connection", async (vonageWS, request) => {
     // Check if there's an in-progress prewarm to wait for
     const inProgressPrewarm = prewarmedSessions.get(conversationId);
     if (inProgressPrewarm && !inProgressPrewarm.ready) {
-      console.log("[CALL] Waiting for in-progress prewarm (up to 4s)...");
+      console.log("[CALL] Waiting for in-progress prewarm (up to 8s)...");
       const waitStart = Date.now();
-      while (!inProgressPrewarm.ready && Date.now() - waitStart < 4000) {
+      while (!inProgressPrewarm.ready && Date.now() - waitStart < 8000) {
         await new Promise((resolve) => setTimeout(resolve, 50));
       }
       prewarmedSessions.delete(conversationId);
@@ -574,11 +584,13 @@ wss.on("connection", async (vonageWS, request) => {
     }
 
     try {
-      config = await fetchVoiceConfig(businessId);
-      console.log("[CALL] Config loaded: voice=" + config.voice);
-
-      openaiWS = await connectOpenAI();
-      console.log("[CALL] OpenAI connected");
+      const [coldConfig, coldWS] = await Promise.all([
+        fetchVoiceConfig(businessId),
+        connectOpenAI(),
+      ]);
+      config = coldConfig;
+      openaiWS = coldWS;
+      console.log("[CALL] Config+OpenAI ready (cold start): voice=" + config.voice);
 
       configureOpenAISession(openaiWS, config);
 
