@@ -189,12 +189,13 @@ function connectOpenAI() {
 }
 
 function configureOpenAISession(openaiWS, config) {
+  const baseVoice = (config.voice || "ash").split("+")[0];
   const msg = {
     type: "session.update",
     session: {
       modalities: ["text", "audio"],
       instructions: config.instructions,
-      voice: config.voice,
+      voice: baseVoice,
       input_audio_format: "pcm16",
       output_audio_format: "pcm16",
       input_audio_transcription: { model: "whisper-1" },
@@ -248,6 +249,7 @@ wss.on("connection", async (vonageWS, request) => {
   let greetingSent = false;
   let greetingDone = false;
   let greetingResponseId = null;
+  let greetingAudioReceived = false;
   let vonageStreamReady = false;
   let openaiReady = false;
   let config = null;
@@ -256,6 +258,7 @@ wss.on("connection", async (vonageWS, request) => {
   let audioPacketsReceived = 0;
   const audioBuffer = [];
   const callerAudioDuringGreeting = [];
+  let greetingTimeoutId = null;
 
   // Check for pre-warmed session
   const prewarmed = prewarmedSessions.get(conversationId);
@@ -282,7 +285,14 @@ wss.on("connection", async (vonageWS, request) => {
   };
 
   const sendVonageAudio = (base64Audio24k) => {
-    if (vonageWS.readyState !== WebSocket.OPEN || !vonageStreamReady) return;
+    if (vonageWS.readyState !== WebSocket.OPEN) {
+      if (audioPacketsSent === 0) console.log("[CALL] sendVonageAudio skipped: WS state=" + vonageWS.readyState);
+      return;
+    }
+    if (!vonageStreamReady) {
+      if (audioPacketsSent === 0) console.log("[CALL] sendVonageAudio skipped: stream not ready");
+      return;
+    }
 
     try {
       const audio16kBase64 = resample24kTo16k(base64Audio24k);
@@ -319,24 +329,36 @@ wss.on("connection", async (vonageWS, request) => {
     }
   };
 
-  const trySendGreeting = () => {
-    if (greetingSent || !vonageStreamReady || !openaiReady || !config) return;
-    console.log("[CALL] Sending greeting: \"" + config.greeting + "\"");
+  const sendGreetingRequest = () => {
     sendOpenAI({ type: "input_audio_buffer.clear" });
-    const greetingMsg = {
+    sendOpenAI({
       type: "response.create",
       response: {
         modalities: ["audio", "text"],
         instructions: "Please say exactly: \"" + config.greeting + "\"",
       },
-    };
-    sendOpenAI(greetingMsg);
+    });
+  };
+
+  const trySendGreeting = () => {
+    if (greetingSent || !vonageStreamReady || !openaiReady || !config) return;
+    console.log("[CALL] Sending greeting: \"" + config.greeting + "\"");
+    sendGreetingRequest();
     greetingSent = true;
+
+    greetingTimeoutId = setTimeout(() => {
+      if (!greetingAudioReceived && !greetingDone && !cleaned) {
+        console.log("[CALL] Greeting timeout — no audio received from OpenAI, retrying greeting");
+        greetingResponseId = null;
+        sendGreetingRequest();
+      }
+    }, 5000);
   };
 
   const cleanup = () => {
     if (cleaned) return;
     cleaned = true;
+    if (greetingTimeoutId) clearTimeout(greetingTimeoutId);
     console.log("[CALL] Cleanup: biz=" + businessId + " sent=" + audioPacketsSent + " recv=" + audioPacketsReceived);
     try { if (openaiWS) openaiWS.close(); } catch (e) {}
     try { vonageWS.close(); } catch (e) {}
@@ -403,7 +425,17 @@ wss.on("connection", async (vonageWS, request) => {
       try {
         const evt = JSON.parse(raw.toString());
 
+        const ignoredTypes = new Set(["response.audio.delta", "input_audio_buffer.committed", "response.output_item.added", "response.content_part.added", "response.content_part.done", "response.output_item.done", "conversation.item.created"]);
+        if (!ignoredTypes.has(evt.type)) {
+          console.log("[OPENAI] " + evt.type + (evt.response ? " id=" + (evt.response.id || "") + " status=" + (evt.response.status || "") : "") + (evt.error ? " err=" + JSON.stringify(evt.error) : ""));
+        }
+
         if (evt.type === "response.audio.delta" && evt.delta) {
+          if (!greetingAudioReceived) {
+            greetingAudioReceived = true;
+            if (greetingTimeoutId) { clearTimeout(greetingTimeoutId); greetingTimeoutId = null; }
+            console.log("[CALL] First greeting audio delta received from OpenAI");
+          }
           sendVonageAudio(evt.delta);
         }
 
@@ -414,11 +446,21 @@ wss.on("connection", async (vonageWS, request) => {
 
         if (evt.type === "response.done") {
           const responseId = evt.response && evt.response.id;
+          const responseStatus = evt.response && evt.response.status;
           if (!greetingDone && (responseId === greetingResponseId || greetingResponseId === null)) {
-            greetingDone = true;
-            console.log("[CALL] Greeting complete — enabling VAD and flushing caller audio");
-            enableVAD(openaiWS);
-            flushCallerAudioBuffer();
+            if (responseStatus === "cancelled" || responseStatus === "failed") {
+              console.log("[CALL] Greeting response " + responseStatus + " — retrying greeting");
+              greetingResponseId = null;
+              greetingAudioReceived = false;
+              if (greetingTimeoutId) { clearTimeout(greetingTimeoutId); greetingTimeoutId = null; }
+              sendGreetingRequest();
+            } else {
+              greetingDone = true;
+              if (greetingTimeoutId) { clearTimeout(greetingTimeoutId); greetingTimeoutId = null; }
+              console.log("[CALL] Greeting complete — enabling VAD and flushing caller audio");
+              enableVAD(openaiWS);
+              flushCallerAudioBuffer();
+            }
           }
         }
 
@@ -451,6 +493,7 @@ wss.on("connection", async (vonageWS, request) => {
           if (!greetingDone && greetingSent) {
             console.log("[CALL] Greeting failed due to error — enabling VAD anyway");
             greetingDone = true;
+            if (greetingTimeoutId) { clearTimeout(greetingTimeoutId); greetingTimeoutId = null; }
             enableVAD(openaiWS);
             flushCallerAudioBuffer();
           }
