@@ -198,6 +198,16 @@ function configureOpenAISession(openaiWS, config) {
       input_audio_format: "pcm16",
       output_audio_format: "pcm16",
       input_audio_transcription: { model: "whisper-1" },
+      turn_detection: null,
+    },
+  };
+  openaiWS.send(JSON.stringify(msg));
+}
+
+function enableVAD(openaiWS) {
+  openaiWS.send(JSON.stringify({
+    type: "session.update",
+    session: {
       turn_detection: {
         type: "server_vad",
         threshold: 0.5,
@@ -205,8 +215,7 @@ function configureOpenAISession(openaiWS, config) {
         silence_duration_ms: 500,
       },
     },
-  };
-  openaiWS.send(JSON.stringify(msg));
+  }));
 }
 
 async function prewarmSession(session) {
@@ -237,6 +246,8 @@ wss.on("connection", async (vonageWS, request) => {
 
   let openaiWS = null;
   let greetingSent = false;
+  let greetingDone = false;
+  let greetingResponseId = null;
   let vonageStreamReady = false;
   let openaiReady = false;
   let config = null;
@@ -244,6 +255,7 @@ wss.on("connection", async (vonageWS, request) => {
   let audioPacketsSent = 0;
   let audioPacketsReceived = 0;
   const audioBuffer = [];
+  const callerAudioDuringGreeting = [];
 
   // Check for pre-warmed session
   const prewarmed = prewarmedSessions.get(conversationId);
@@ -296,16 +308,29 @@ wss.on("connection", async (vonageWS, request) => {
     }
   };
 
+  const flushCallerAudioBuffer = () => {
+    if (callerAudioDuringGreeting.length > 0) {
+      console.log("[CALL] Flushing " + callerAudioDuringGreeting.length + " buffered caller audio chunks after greeting");
+      for (const chunk of callerAudioDuringGreeting) {
+        const audio24k = resample16kTo24k(chunk);
+        sendOpenAI({ type: "input_audio_buffer.append", audio: audio24k });
+      }
+      callerAudioDuringGreeting.length = 0;
+    }
+  };
+
   const trySendGreeting = () => {
     if (greetingSent || !vonageStreamReady || !openaiReady || !config) return;
     console.log("[CALL] Sending greeting: \"" + config.greeting + "\"");
-    sendOpenAI({
+    sendOpenAI({ type: "input_audio_buffer.clear" });
+    const greetingMsg = {
       type: "response.create",
       response: {
         modalities: ["audio", "text"],
         instructions: "Please say exactly: \"" + config.greeting + "\"",
       },
-    });
+    };
+    sendOpenAI(greetingMsg);
     greetingSent = true;
   };
 
@@ -352,8 +377,13 @@ wss.on("connection", async (vonageWS, request) => {
 
         const base64_16k = data.toString("base64");
         if (openaiReady && openaiWS && openaiWS.readyState === WebSocket.OPEN) {
-          const audio24k = resample16kTo24k(base64_16k);
-          sendOpenAI({ type: "input_audio_buffer.append", audio: audio24k });
+          if (!greetingDone) {
+            callerAudioDuringGreeting.push(base64_16k);
+            if (callerAudioDuringGreeting.length > 500) callerAudioDuringGreeting.shift();
+          } else {
+            const audio24k = resample16kTo24k(base64_16k);
+            sendOpenAI({ type: "input_audio_buffer.append", audio: audio24k });
+          }
         } else {
           audioBuffer.push(base64_16k);
           if (audioBuffer.length > 500) audioBuffer.shift();
@@ -375,6 +405,21 @@ wss.on("connection", async (vonageWS, request) => {
 
         if (evt.type === "response.audio.delta" && evt.delta) {
           sendVonageAudio(evt.delta);
+        }
+
+        if (evt.type === "response.created" && !greetingResponseId && greetingSent) {
+          greetingResponseId = evt.response && evt.response.id;
+          console.log("[CALL] Greeting response ID: " + greetingResponseId);
+        }
+
+        if (evt.type === "response.done") {
+          const responseId = evt.response && evt.response.id;
+          if (!greetingDone && (responseId === greetingResponseId || greetingResponseId === null)) {
+            greetingDone = true;
+            console.log("[CALL] Greeting complete — enabling VAD and flushing caller audio");
+            enableVAD(openaiWS);
+            flushCallerAudioBuffer();
+          }
         }
 
         if (evt.type === "session.created") {
@@ -403,6 +448,12 @@ wss.on("connection", async (vonageWS, request) => {
 
         if (evt.type === "error") {
           console.error("[CALL] OpenAI error:", JSON.stringify(evt.error));
+          if (!greetingDone && greetingSent) {
+            console.log("[CALL] Greeting failed due to error — enabling VAD anyway");
+            greetingDone = true;
+            enableVAD(openaiWS);
+            flushCallerAudioBuffer();
+          }
         }
       } catch (e) {
         console.error("[CALL] OpenAI msg parse error:", e.message);
