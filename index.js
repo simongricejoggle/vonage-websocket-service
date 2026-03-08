@@ -1,1016 +1,446 @@
-// Vonage WebSocket Service v1.1 - Parallel OpenAI + Silence Keep-Alive
-// Updated: Nov 14, 2025 - Fixed immediate greeting with parallel connection
-require('dotenv').config();
-const express = require('express');
-const { WebSocketServer } = require('ws');
-const WebSocket = require('ws');
+const { createServer } = require("http");
+const { WebSocketServer, WebSocket } = require("ws");
 
-const app = express();
 const PORT = process.env.PORT || 8080;
+const JOGGLE_API = process.env.JOGGLE_API || "https://joggle.it";
+const RELAY_KEY = process.env.PHONE_RELAY_KEY;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview";
+const PREWARM_TTL = 30000;
 
-// Resample PCM16 audio from 24kHz to 16kHz
-function resample24to16(buffer24k) {
-  // Convert buffer to Int16Array (Node.js uses little-endian by default, which is correct for PCM16)
-  const samples24k = new Int16Array(buffer24k.buffer, buffer24k.byteOffset, buffer24k.length / 2);
-  const ratio = 24000 / 16000; // 1.5
-  const outputLength = Math.floor(samples24k.length / ratio);
-  const samples16k = new Int16Array(outputLength);
-  
-  // Simple linear interpolation downsampling
-  for (let i = 0; i < outputLength; i++) {
-    const srcIndex = i * ratio;
-    const srcIndexFloor = Math.floor(srcIndex);
-    const srcIndexCeil = Math.min(srcIndexFloor + 1, samples24k.length - 1);
-    const fraction = srcIndex - srcIndexFloor;
-    
-    // Linear interpolation
-    samples16k[i] = Math.round(
-      samples24k[srcIndexFloor] * (1 - fraction) + 
-      samples24k[srcIndexCeil] * fraction
-    );
-  }
-  
-  // Return as Buffer (preserves little-endian byte order)
-  return Buffer.from(samples16k.buffer, samples16k.byteOffset, samples16k.byteLength);
+if (!OPENAI_API_KEY) {
+  console.error("OPENAI_API_KEY is required");
+  process.exit(1);
 }
 
-const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`✅ WebSocket server running on port ${PORT}`);
-});
-
-app.get('/', (req, res) => {
-  res.json({ 
-    status: 'running',
-    service: 'Vonage WebSocket Service',
-    timestamp: new Date().toISOString()
-  });
-});
-
-app.get('/health', (req, res) => {
-  res.json({ healthy: true });
-});
-
-// Pre-warm endpoint - called by Replit server when NCCO is generated
-app.post('/prewarm', express.json(), async (req, res) => {
-  const { conversationId: rawConvId, businessId } = req.body;
-  const conversationId = rawConvId?.toLowerCase(); // Normalize to lowercase
-  
-  if (!conversationId || !businessId) {
-    return res.status(400).json({ 
-      success: false, 
-      error: 'Missing conversationId or businessId' 
-    });
-  }
-  
-  console.log(`🔥 Pre-warm request received for ${conversationId} (${businessId})`);
-  
-  // Start pre-warming in background (don't wait for it)
-  prewarmOpenAIConnection(conversationId, businessId)
-    .then(() => {
-      console.log(`✅ Pre-warm completed for ${conversationId}`);
-    })
-    .catch(err => {
-      console.error(`❌ Pre-warm failed for ${conversationId}:`, err.message);
-    });
-  
-  // Return immediately
-  res.json({ success: true, message: 'Pre-warming started' });
-});
-
-app.get('/test-openai', async (req, res) => {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    return res.status(500).json({ 
-      success: false, 
-      error: 'OPENAI_API_KEY not configured' 
-    });
-  }
-
-  try {
-    const WebSocket = require('ws');
-    const testWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-realtime-2025-08-28', {
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'OpenAI-Beta': 'realtime=v1'
-      },
-      protocol: 'realtime'
-    });
-
-    const timeout = setTimeout(() => {
-      testWs.close();
-      res.status(500).json({ 
-        success: false, 
-        error: 'Connection timeout' 
-      });
-    }, 10000);
-
-    testWs.on('open', () => {
-      clearTimeout(timeout);
-      testWs.close();
-      res.json({ 
-        success: true, 
-        message: 'Successfully connected to OpenAI Realtime API',
-        apiKeyConfigured: true
-      });
-    });
-
-    testWs.on('error', (error) => {
-      clearTimeout(timeout);
-      res.status(500).json({ 
-        success: false, 
-        error: error.message,
-        apiKeyConfigured: true
-      });
-    });
-  } catch (error) {
-    res.status(500).json({ 
-      success: false, 
-      error: error.message 
-    });
-  }
-});
-
-// NOTE: NCCO endpoint removed - it's handled by the main Replit server
-// The Replit server calls /prewarm endpoint above to trigger pre-warming
-
-const wss = new WebSocketServer({ 
-  server,
-  path: "/plugins/phone/stream",
-  perMessageDeflate: false,
-  clientNoContextTakeover: true,
-  serverNoContextTakeover: true
-});
-
-console.log("🎤 WebSocket server registered on /plugins/phone/stream");
-
-// ============================================================================
-// PREWARMED SESSION CLASS
-// ============================================================================
-// Manages OpenAI Realtime connection lifecycle with audio buffering
-class PrewarmedSession {
-  constructor(conversationId, businessId) {
-    this.conversationId = conversationId;
-    this.businessId = businessId;
-    this.ws = null;
-    this.ready = false;
-    this.attached = false;
-    this.audioBuffer = []; // Buffer audio deltas until Vonage attaches
-    this.sendToVonage = null; // Callback to send audio to Vonage
-    this.greetingResponseId = null;
-    this.greetingComplete = false;
-    this.isAiSpeaking = false;
-    this.firstAudioSent = false;
-    this.onFirstAudio = null; // Callback when first audio is sent
-    
-    // Knowledge/config data
-    this.welcomeGreeting = "Hi, this is Joggle answering for your business.";
-    this.voiceConfig = { voice: "ash", speed: 1.0 };
-    this.knowledge = null;
-    this.languagePrompt = null;
-    this.voiceInstructions = null;
-    this.fullInstructions = null;
-    
-    console.log(`🎯 Creating PrewarmedSession for ${conversationId}`);
-  }
-
-  async initialize() {
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) {
-      throw new Error('OPENAI_API_KEY not configured');
-    }
-
-    // Create OpenAI WebSocket with beta protocol
-    this.ws = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-realtime-2025-08-28', {
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'OpenAI-Beta': 'realtime=v1'
-      },
-      protocol: 'realtime'
-    });
-
-    // Set up event handlers
-    this.setupEventHandlers();
-
-    // Wait ONLY for session ready (fast - just WebSocket connection)
-    await this.waitForReady();
-    console.log(`✅ Session ${this.conversationId} ready (OpenAI connected)`);
-    
-    // 🚀 CRITICAL: Send greeting IMMEDIATELY with default config
-    // This starts buffering audio RIGHT NOW (2-3s before Vonage connects)
-    console.log(`🎤 Sending immediate greeting to start buffering...`);
-    this.sendGreeting();
-    
-    // Fetch knowledge in background and update session after greeting
-    this.fetchKnowledge().then(() => {
-      console.log(`📚 Knowledge loaded for ${this.conversationId} - will apply after greeting`);
-      
-      // Apply full knowledge AFTER greeting completes (for subsequent responses)
-      // Don't interrupt the greeting that's already playing
-      if (this.fullInstructions && this.greetingComplete) {
-        this.applyFullKnowledge();
-      }
-    }).catch(err => {
-      console.error(`❌ Knowledge fetch failed for ${this.conversationId}:`, err.message);
-    });
-    
-    return this;
-  }
-
-  setupEventHandlers() {
-    this.ws.on('open', () => {
-      console.log(`✅ OpenAI connected for session ${this.conversationId}`);
-      
-      // Send initial session config - beta partial update
-      // CRITICAL: Start with turn_detection=null so user speech doesn't interrupt greeting
-      const sessionConfig = {
-        type: "session.update",
-        session: {
-          modalities: ["text", "audio"],
-          instructions: "You are a helpful assistant.",
-          voice: "ash",
-          input_audio_format: "pcm16",
-          output_audio_format: "pcm16",
-          turn_detection: null, // Disabled during greeting
-          temperature: 0.8
-        }
-      };
-      this.ws.send(JSON.stringify(sessionConfig));
-    });
-
-    this.ws.on('message', (raw) => {
-      try {
-        const evt = JSON.parse(raw.toString());
-        
-        // Log session.created (first event from OpenAI)
-        if (evt.type === 'session.created') {
-          console.log(`📝 Session created for ${this.conversationId}`);
-        }
-        
-        // Mark ready when session is updated (AFTER config is acknowledged)
-        if (evt.type === 'session.updated') {
-          if (!this.ready) {
-            this.ready = true;
-            console.log(`🎯 Session ready (updated): ${this.conversationId}`);
-          }
-        }
-        
-        // Track response lifecycle
-        if (evt.type === 'response.created') {
-          if (!this.greetingResponseId) {
-            this.greetingResponseId = evt.response.id;
-            console.log(`🎤 Greeting response: ${this.greetingResponseId}`);
-          }
-        }
-        
-        if (evt.type === 'response.output_item.added') {
-          this.isAiSpeaking = true;
-          console.log(`🔊 AI speaking in session ${this.conversationId}`);
-        }
-        
-        // CRITICAL: Buffer audio deltas until Vonage attaches
-        // Beta API uses 'response.audio.delta' (not 'response.output_audio.delta')
-        if (evt.type === 'response.audio.delta' && evt.delta) {
-          if (this.attached && this.sendToVonage) {
-            // Directly forward to Vonage
-            this.sendToVonage(evt.delta);
-            // Notify on first audio
-            if (this.onFirstAudio && !this.firstAudioSent) {
-              this.firstAudioSent = true;
-              this.onFirstAudio();
-              console.log(`🎵 Sending first audio delta to Vonage (${evt.delta.length} chars base64)`);
-            }
-          } else {
-            // Buffer until Vonage ready
-            this.audioBuffer.push(evt.delta);
-            if (this.audioBuffer.length === 1) {
-              console.log(`📦 Buffering audio for ${this.conversationId} (Vonage not attached yet)`);
-            }
-          }
-        }
-        
-        if (evt.type === 'response.done') {
-          this.isAiSpeaking = false;
-          if (this.greetingResponseId && evt.response.id === this.greetingResponseId) {
-            this.greetingComplete = true;
-            console.log(`🎉 Greeting complete in session ${this.conversationId}`);
-            
-            // Enable turn detection NOW (greeting won't be interrupted)
-            console.log(`🎤 Enabling turn detection for conversation...`);
-            this.ws.send(JSON.stringify({
-              type: "session.update",
-              session: {
-                turn_detection: {
-                  type: "server_vad",
-                  threshold: 0.5,
-                  prefix_padding_ms: 300,
-                  silence_duration_ms: 700,
-                  create_response: true
-                }
-              }
-            }));
-            
-            // Apply full knowledge if loaded
-            if (this.fullInstructions) {
-              this.applyFullKnowledge();
-            }
-          }
-        }
-        
-        // Log any errors from OpenAI
-        if (evt.type === 'error') {
-          console.error(`❌ OpenAI error in ${this.conversationId}:`, JSON.stringify(evt.error));
-        }
-        
-      } catch (err) {
-        // Ignore parse errors
-      }
-    });
-
-    this.ws.on('error', (error) => {
-      console.error(`❌ OpenAI error in session ${this.conversationId}:`, error.message);
-    });
-
-    this.ws.on('close', () => {
-      console.log(`🤖 OpenAI closed for session ${this.conversationId}`);
-      this.ready = false;
-    });
-  }
-
-  waitForReady() {
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        reject(new Error('Session ready timeout'));
-      }, 15000);
-
-      const checkReady = setInterval(() => {
-        if (this.ready) {
-          clearInterval(checkReady);
-          clearTimeout(timeout);
-          resolve();
-        }
-      }, 100);
-    });
-  }
-
-  async fetchKnowledge() {
-    try {
-      const knowledgeUrl = `${process.env.REPLIT_APP_URL || 'https://myjoggle.replit.app'}/api/phone/knowledge/${this.businessId}`;
-      const response = await fetch(knowledgeUrl);
-      
-      if (response.ok) {
-        const data = await response.json();
-        if (data.success) {
-          this.welcomeGreeting = data.voiceConfig?.welcomeGreeting || this.welcomeGreeting;
-          this.voiceConfig = data.voiceConfig || this.voiceConfig;
-          this.knowledge = data.knowledge;
-          this.languagePrompt = data.languagePrompt;
-          this.voiceInstructions = data.voiceInstructions;
-          
-          // Build full instructions
-          let instructions = "";
-          if (this.languagePrompt) {
-            instructions = `${this.languagePrompt}\n\n==========\n\n`;
-          }
-          instructions += "You are a helpful assistant.";
-          if (this.knowledge) {
-            instructions += `\n\nKNOWLEDGE BASE:\n${this.knowledge}`;
-          }
-          if (this.voiceInstructions) {
-            instructions += this.voiceInstructions;
-          }
-          
-          this.fullInstructions = instructions;
-          console.log(`📚 Knowledge loaded for session ${this.conversationId} (${instructions.length} chars)`);
-          
-          // Apply knowledge immediately if greeting already done
-          if (this.greetingComplete) {
-            this.applyFullKnowledge();
-          }
-        }
-      }
-    } catch (error) {
-      console.log(`⚠️ Knowledge fetch failed for ${this.conversationId}:`, error.message);
-    }
-  }
-
-  applyFullKnowledge() {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    
-    // Update session with full knowledge - beta partial update
-    const sessionConfig = {
-      type: "session.update",
-      session: {
-        instructions: this.fullInstructions
-      }
-    };
-    this.ws.send(JSON.stringify(sessionConfig));
-    console.log(`✅ Applied full knowledge to session ${this.conversationId}`);
-  }
-
-  // Attach to Vonage call - provide callback to send audio
-  attachToVonage(sendAudioCallback, onFirstAudioCallback = null) {
-    if (this.attached) {
-      console.warn(`⚠️ Session ${this.conversationId} already attached`);
-      return;
-    }
-    
-    this.attached = true;
-    this.sendToVonage = sendAudioCallback;
-    this.onFirstAudio = onFirstAudioCallback;
-    console.log(`🔌 Vonage attached to session ${this.conversationId}`);
-    
-    // Flush buffered audio - sends immediately to Vonage
-    if (this.audioBuffer.length > 0) {
-      console.log(`🎵 Flushing ${this.audioBuffer.length} buffered audio deltas to Vonage`);
-      this.audioBuffer.forEach(delta => {
-        this.sendToVonage(delta);
-        // Notify on first audio
-        if (this.onFirstAudio && !this.firstAudioSent) {
-          this.firstAudioSent = true;
-          this.onFirstAudio();
-        }
-      });
-      this.audioBuffer = [];
-    }
-  }
-
-  // Send greeting instruction
-  sendGreeting() {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      console.error(`❌ Cannot send greeting - session ${this.conversationId} not ready`);
-      return false;
-    }
-    
-    // Beta API: modalities INSIDE response object
-    const triggerGreeting = {
-      type: "response.create",
-      response: {
-        modalities: ["audio", "text"],  // Inside response for beta
-        instructions: `Say: "${this.welcomeGreeting}"`
-      }
-    };
-    
-    this.ws.send(JSON.stringify(triggerGreeting));
-    console.log(`👋 Greeting sent in session ${this.conversationId}`);
-    return true;
-  }
-
-  // Send audio from Vonage to OpenAI
-  sendAudioToOpenAI(base64Audio) {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({
-        type: "input_audio_buffer.append",
-        audio: base64Audio
-      }));
-    }
-  }
-
-  // Clean up
-  close() {
-    if (this.ws) {
-      this.ws.close();
-    }
-  }
+if (!RELAY_KEY) {
+  console.error("PHONE_RELAY_KEY is required");
+  process.exit(1);
 }
 
-// Connection pool for pre-warmed sessions
-const prewarmPool = new Map();
+// ── Audio Resampling ──
+// Vonage sends/expects pcm16 at 16kHz
+// OpenAI Realtime API requires pcm16 at 24kHz
+// We must resample in both directions
 
-// Pre-warm session function
-async function prewarmOpenAIConnection(conversationId, businessId) {
-  console.log(`🔥 Starting pre-warm for conversation: ${conversationId}`);
-  
-  try {
-    // Create and initialize session
-    const session = new PrewarmedSession(conversationId, businessId);
-    await session.initialize();
-    
-    // Store in pool with timestamp
-    prewarmPool.set(conversationId, {
-      session,
-      timestamp: Date.now()
-    });
-    
-    console.log(`✅ Pre-warm completed for ${conversationId}`);
-    return session;
-  } catch (error) {
-    console.error(`❌ Pre-warm failed for ${conversationId}:`, error.message);
-    prewarmPool.delete(conversationId);
-    throw error;
+function resample16kTo24k(base64Audio) {
+  const inputBuf = Buffer.from(base64Audio, "base64");
+  const sampleCount = inputBuf.length / 2;
+  const outputCount = Math.floor(sampleCount * 1.5);
+  const output = Buffer.alloc(outputCount * 2);
+
+  for (let i = 0; i < outputCount; i++) {
+    const srcPos = (i * 2) / 3;
+    const srcIdx = Math.floor(srcPos);
+    const frac = srcPos - srcIdx;
+    const s0 = srcIdx < sampleCount ? inputBuf.readInt16LE(srcIdx * 2) : 0;
+    const s1 = srcIdx + 1 < sampleCount ? inputBuf.readInt16LE((srcIdx + 1) * 2) : s0;
+    const sample = Math.round(s0 + frac * (s1 - s0));
+    output.writeInt16LE(Math.max(-32768, Math.min(32767, sample)), i * 2);
   }
+
+  return output.toString("base64");
 }
 
-// Cleanup old pre-warmed sessions after 90 seconds
-setInterval(() => {
-  const now = Date.now();
-  for (const [conversationId, data] of prewarmPool.entries()) {
-    if (now - data.timestamp > 90000) {
-      console.log(`🧹 Cleaning up expired pre-warmed session: ${conversationId}`);
-      if (data.session) {
-        data.session.close();
-      }
-      prewarmPool.delete(conversationId);
-    }
-  }
-}, 15000);
+function resample24kTo16k(base64Audio) {
+  const inputBuf = Buffer.from(base64Audio, "base64");
+  const sampleCount = inputBuf.length / 2;
+  const outputCount = Math.floor(sampleCount * (2 / 3));
+  const output = Buffer.alloc(outputCount * 2);
 
-// Add connection attempt logging
-wss.on('headers', (headers, request) => {
-  console.log("🔍 WebSocket upgrade attempt - Headers:", headers);
-  console.log("🔍 Request headers:", request.headers);
-  console.log("🔍 Request URL:", request.url);
-});
+  for (let i = 0; i < outputCount; i++) {
+    const srcPos = (i * 3) / 2;
+    const srcIdx = Math.floor(srcPos);
+    const frac = srcPos - srcIdx;
+    const s0 = srcIdx < sampleCount ? inputBuf.readInt16LE(srcIdx * 2) : 0;
+    const s1 = srcIdx + 1 < sampleCount ? inputBuf.readInt16LE((srcIdx + 1) * 2) : s0;
+    const sample = Math.round(s0 + frac * (s1 - s0));
+    output.writeInt16LE(Math.max(-32768, Math.min(32767, sample)), i * 2);
+  }
 
-wss.on("connection", async (vonageWS, request) => {
-  console.log("📞 New Vonage WebSocket connection ESTABLISHED");
-  console.log("📞 Request URL:", request.url);
-  console.log("📞 Request headers:", JSON.stringify(request.headers, null, 2));
-  
-  const url = new URL(request.url || '', `http://${request.headers.host}`);
-  const businessId = url.searchParams.get('business_id') || url.searchParams.get('assistant_id') || "default";
-  const conversationId = (url.searchParams.get('conversation_id') || "unknown").toLowerCase(); // Normalize to lowercase
-  const fromNumber = url.searchParams.get('from') || "unknown";
-  const toNumber = url.searchParams.get('to') || "unknown";
-  
-  console.log(`🏢 Business: ${businessId}, Conversation: ${conversationId}`);
-  console.log(`📞 From: ${fromNumber}, To: ${toNumber}`);
-  
-  // Track call start time for duration calculation
-  const callStartTime = Date.now();
-  
-  // Create call log on main server
-  const apiUrl = process.env.REPLIT_APP_URL || 'https://myjoggle.replit.app';
-  const trackingSecret = process.env.CALL_TRACKING_SECRET;
-  
-  if (!trackingSecret) {
-    console.error('❌ FATAL: CALL_TRACKING_SECRET environment variable is not set!');
-    console.error('❌ Call tracking will be disabled. Conversation will NOT be logged or summarized.');
+  return output.toString("base64");
+}
+
+// ── Pre-warmed Sessions ──
+const prewarmedSessions = new Map();
+
+// ── HTTP Server ──
+const server = createServer((req, res) => {
+  if (req.url === "/health") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ status: "ok", uptime: process.uptime(), prewarmed: prewarmedSessions.size }));
+    return;
   }
-  
-  const callTrackingHeaders = trackingSecret ? {
-    'Content-Type': 'application/json',
-    'X-Call-Tracking-Secret': trackingSecret
-  } : {
-    'Content-Type': 'application/json'
-  };
-  
-  // Start call logging in background (non-blocking) so Vonage handshake isn't delayed
-  if (trackingSecret) {
-    fetch(`${apiUrl}/api/phone/calls/start`, {
-      method: 'POST',
-      headers: callTrackingHeaders,
-      body: JSON.stringify({
-        conversationId,
-        businessId,
-        callerNumber: fromNumber,
-        callNumber: toNumber
-      })
-    }).then(() => {
-      console.log(`📝 Call log created for conversation: ${conversationId}`);
-    }).catch(error => {
-      console.error('❌ Failed to create call log:', error.message);
-    });
-  } else {
-    console.warn('⚠️ Skipping call log creation - no tracking secret configured');
-  }
-  
-  // Vonage-specific call state only
-  let keepAliveInterval = null;
-  let firstAudioReceived = false;
-  let vonageStreamReady = false;
-  let vonageConnected = false; // Track if Vonage sent websocket:connected
-  let vonageMediaReady = false; // Track if Vonage sent websocket:media_start
-  let currentSession = null; // Will hold PrewarmedSession instance
-  let lastAudioSent = 0; // Timestamp of last audio packet sent
-  
-  console.log("🔄 Call state initialized for conversation:", conversationId);
-  
-  // Acquire session (either pre-warmed or create new)
-  async function acquireSession() {
-    // Check for pre-warmed session
-    if (prewarmPool.has(conversationId)) {
-      const poolData = prewarmPool.get(conversationId);
-      prewarmPool.delete(conversationId); // Remove from pool
-      console.log(`🎯 Using pre-warmed session for ${conversationId}`);
-      return poolData.session;
-    }
-    
-    // No pre-warmed session - create new one
-    console.log(`⚠️ No pre-warmed session - creating new session for ${conversationId}`);
-    const session = new PrewarmedSession(conversationId, businessId);
-    await session.initialize();
-    return session;
-  }
-  
-  // Audio queue with proper pacing (50 packets/sec)
-  let audioPacketCount = 0;
-  let leftoverBytes = Buffer.alloc(0);
-  const audioQueue = [];
-  let audioSender = null;
-  
-  const sendVonageAudio = (base64Audio) => {
-    // OpenAI sends 24kHz PCM16, Vonage expects 16kHz PCM16
-    const audioBuffer24k = Buffer.from(base64Audio, 'base64');
-    const audioBuffer16k = resample24to16(audioBuffer24k);
-    
-    // Accumulate: prepend leftover bytes from previous call
-    const combined = Buffer.concat([leftoverBytes, audioBuffer16k]);
-    
-    // Vonage expects EXACTLY 640 bytes per packet (20ms of 16kHz PCM16)
-    // Queue packets for proper pacing
-    const PACKET_SIZE = 640;
-    let offset = 0;
-    while (offset + PACKET_SIZE <= combined.length) {
-      const chunk = combined.slice(offset, offset + PACKET_SIZE);
-      audioQueue.push(chunk);
-      offset += PACKET_SIZE;
-    }
-    
-    // Save remaining bytes for next call
-    leftoverBytes = combined.slice(offset);
-    
-    // Don't auto-start here - let the delayed start after websocket:connected handle it
-  };
-  
-  const startAudioSender = () => {
-    if (audioSender) {
-      console.log("⚠️ Audio sender already running");
+
+  if (req.method === "POST" && req.url === "/prewarm") {
+    const relayKey = req.headers["x-relay-key"];
+    if (relayKey !== RELAY_KEY) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Unauthorized" }));
       return;
     }
-    
-    // Check ONCE at creation - not on every tick
-    if (vonageWS.readyState !== WebSocket.OPEN) {
-      console.log(`❌ Cannot start audio sender - WebSocket not OPEN (state: ${vonageWS.readyState})`);
-      return;
-    }
-    
-    const silenceBuffer = Buffer.alloc(640, 0);
-    
-    // Only send "first packet" if we haven't already sent audio via burst
-    // (audioPacketCount > 0 means we already sent buffered audio)
-    if (audioPacketCount === 0) {
-      console.log(`🚀 Sending first packet immediately (${audioQueue.length} queued)`);
+
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", () => {
       try {
-        if (audioQueue.length > 0) {
-          const firstChunk = audioQueue.shift();
-          // Vonage expects raw binary audio (640-byte PCM16 buffers)
-          vonageWS.send(firstChunk);
-          audioPacketCount++;
-          lastAudioSent = Date.now();
-          console.log(`✅ Sent first packet immediately (640 bytes, ${audioQueue.length} remaining)`);
-        } else {
-          // Send silence as raw binary
-          vonageWS.send(silenceBuffer);
-          lastAudioSent = Date.now();
-          console.log(`✅ Sent silence packet immediately (no audio queued yet)`);
-        }
-      } catch (error) {
-        console.error(`❌ Failed to send initial packet:`, error.message);
-        return;
-      }
-    } else {
-      console.log(`✅ Skipping first packet (already sent ${audioPacketCount} packets via burst)`);
-    }
-    
-    // Then continue at 50 packets/sec (one every 20ms)
-    audioSender = setInterval(() => {
-      try {
-        // Check if WebSocket is still open
-        if (vonageWS.readyState !== WebSocket.OPEN) {
-          console.log(`⚠️ WebSocket closed mid-stream (state: ${vonageWS.readyState}), stopping sender`);
-          clearInterval(audioSender);
-          audioSender = null;
+        const data = JSON.parse(body);
+        const { assistantId, conversationId } = data;
+        if (!assistantId || !conversationId) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "assistantId and conversationId required" }));
           return;
         }
-        
-        if (audioQueue.length > 0) {
-          const chunk = audioQueue.shift();
-          
-          // Validate chunk before sending
-          if (!Buffer.isBuffer(chunk) || chunk.length !== 640) {
-            console.error(`❌ Invalid chunk: isBuffer=${Buffer.isBuffer(chunk)}, length=${chunk?.length}`);
-            return;
+
+        console.log("[PREWARM] Starting for assistant=" + assistantId + " conv=" + conversationId);
+
+        const session = {
+          businessId: String(assistantId),
+          conversationId: conversationId,
+          config: null,
+          openaiWS: null,
+          ready: false,
+          createdAt: Date.now(),
+        };
+        prewarmedSessions.set(conversationId, session);
+
+        prewarmSession(session).catch((err) => {
+          console.error("[PREWARM] Failed for " + conversationId + ":", err.message);
+          prewarmedSessions.delete(conversationId);
+        });
+
+        setTimeout(() => {
+          const s = prewarmedSessions.get(conversationId);
+          if (s) {
+            console.log("[PREWARM] TTL expired for " + conversationId);
+            if (s.openaiWS) { try { s.openaiWS.close(); } catch (e) {} }
+            prewarmedSessions.delete(conversationId);
           }
-          
-          // Send with error handling to catch protocol violations
-          try {
-            // Vonage expects raw binary audio (640-byte PCM16 buffers)
-            vonageWS.send(chunk);
-            audioPacketCount++;
-            lastAudioSent = Date.now();
-            
-            // Log first few packets for verification
-            if (audioPacketCount <= 3) {
-              console.log(`✅ Sent packet #${audioPacketCount} (640 bytes)`);
-            }
-          } catch (sendError) {
-            console.error(`❌ Error sending packet #${audioPacketCount + 1}:`, sendError.message);
-            console.error(`❌ Chunk type: ${typeof chunk}, isBuffer: ${Buffer.isBuffer(chunk)}, length: ${chunk.length}`);
-            clearInterval(audioSender);
-            audioSender = null;
-            return;
-          }
-          
-          if (audioPacketCount <= 10 || audioPacketCount % 100 === 0) {
-            // Check if audio is actually not silence
-            const hasAudio = chunk.some(byte => byte !== 0);
-            console.log(`📤 Sent audio packet #${audioPacketCount} to Vonage (${audioQueue.length} queued, hasAudio: ${hasAudio})`);
-          }
-        } else {
-          // Send silence to keep connection alive (raw binary)
-          vonageWS.send(silenceBuffer);
-          lastAudioSent = Date.now();
-        }
-      } catch (error) {
-        console.error(`❌ Error in audio sender: ${error.message}`, error.stack);
-        clearInterval(audioSender);
-        audioSender = null;
+        }, PREWARM_TTL);
+
+        res.writeHead(202, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "prewarming", conversationId: conversationId }));
+      } catch (e) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Invalid JSON" }));
       }
-    }, 20);
-    
-    console.log(`🎵 Audio sender started (50 packets/sec, ${audioQueue.length} packets queued, WS state: ${vonageWS.readyState})`);
+    });
+    return;
+  }
+
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("Joggle Phone Relay");
+});
+
+// ── WebSocket Server ──
+const wss = new WebSocketServer({ noServer: true });
+
+server.on("upgrade", (request, socket, head) => {
+  const url = new URL(request.url || "", "ws://localhost");
+  const pathname = url.pathname;
+
+  console.log("[UPGRADE] " + pathname);
+
+  if (pathname === "/plugins/phone/stream") {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit("connection", ws, request);
+    });
+  } else {
+    console.log("[UPGRADE] Rejected: " + pathname);
+    socket.destroy();
+  }
+});
+
+// ── Helper Functions ──
+
+async function fetchVoiceConfig(assistantId) {
+  try {
+    const url = JOGGLE_API + "/api/internal/phone/voice-config/" + encodeURIComponent(assistantId);
+    console.log("[CONFIG] Fetching: " + url);
+    const res = await fetch(url, {
+      headers: { "x-relay-key": RELAY_KEY },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return await res.json();
+  } catch (err) {
+    console.error("[CONFIG] Failed for " + assistantId + ":", err.message);
+    return {
+      voice: "ash",
+      greeting: "Hello, how can I help you today?",
+      instructions: "You are a helpful phone assistant. Be concise and friendly.",
+    };
+  }
+}
+
+function connectOpenAI() {
+  return new Promise((resolve, reject) => {
+    const url = "wss://api.openai.com/v1/realtime?model=" + encodeURIComponent(OPENAI_MODEL);
+    const ws = new WebSocket(url, {
+      headers: { Authorization: "Bearer " + OPENAI_API_KEY, "OpenAI-Beta": "realtime=v1" },
+    });
+    const timeout = setTimeout(() => {
+      ws.terminate();
+      reject(new Error("OpenAI connection timeout"));
+    }, 10000);
+    ws.once("open", () => { clearTimeout(timeout); resolve(ws); });
+    ws.once("error", (e) => { clearTimeout(timeout); reject(e); });
+  });
+}
+
+function configureOpenAISession(openaiWS, config) {
+  const msg = {
+    type: "session.update",
+    session: {
+      modalities: ["text", "audio"],
+      instructions: config.instructions,
+      voice: config.voice,
+      input_audio_format: "pcm16",
+      output_audio_format: "pcm16",
+      input_audio_transcription: { model: "whisper-1" },
+      turn_detection: {
+        type: "server_vad",
+        threshold: 0.5,
+        prefix_padding_ms: 300,
+        silence_duration_ms: 500,
+      },
+    },
   };
-  
-  // Callback when first audio arrives
-  const onFirstAudio = () => {
-    if (!firstAudioReceived) {
-      firstAudioReceived = true;
-      console.log("🎵 First audio from OpenAI received");
-    }
-  };
-  
-  // Helper function to store conversation messages
-  const storeMessage = async (role, content) => {
-    if (!content || !trackingSecret) return;
-    try {
-      await fetch(`${apiUrl}/api/phone/calls/message`, {
-        method: 'POST',
-        headers: callTrackingHeaders,
-        body: JSON.stringify({
-          conversationId,
-          role,
-          content
-        })
-      });
-    } catch (error) {
-      console.error('❌ Failed to store message:', error.message);
+  openaiWS.send(JSON.stringify(msg));
+}
+
+async function prewarmSession(session) {
+  const t0 = Date.now();
+
+  session.config = await fetchVoiceConfig(session.businessId);
+  console.log("[PREWARM] Config in " + (Date.now() - t0) + "ms");
+
+  session.openaiWS = await connectOpenAI();
+  console.log("[PREWARM] OpenAI in " + (Date.now() - t0) + "ms");
+
+  configureOpenAISession(session.openaiWS, session.config);
+
+  session.ready = true;
+  console.log("[PREWARM] Ready in " + (Date.now() - t0) + "ms for " + session.conversationId);
+}
+
+// ── Call Handler ──
+
+wss.on("connection", async (vonageWS, request) => {
+  const url = new URL(request.url || "", "ws://localhost");
+  const businessId = url.searchParams.get("assistant_id") || url.searchParams.get("business_id") || "default";
+  const conversationId = url.searchParams.get("conversation_id") || "unknown";
+  const fromNumber = url.searchParams.get("from") || "unknown";
+  const toNumber = url.searchParams.get("to") || "unknown";
+
+  console.log("[CALL] New: biz=" + businessId + " conv=" + conversationId + " from=" + fromNumber);
+
+  let openaiWS = null;
+  let streamId = "";
+  let greetingSent = false;
+  let vonageStreamReady = false;
+  let openaiReady = false;
+  let config = null;
+  let cleaned = false;
+  let audioPacketsSent = 0;
+  let audioPacketsReceived = 0;
+  const audioBuffer = [];
+
+  // Check for pre-warmed session
+  const prewarmed = prewarmedSessions.get(conversationId);
+  if (prewarmed && prewarmed.ready && prewarmed.openaiWS && prewarmed.openaiWS.readyState === WebSocket.OPEN) {
+    console.log("[CALL] Using pre-warmed session");
+    openaiWS = prewarmed.openaiWS;
+    config = prewarmed.config;
+    openaiReady = true;
+    prewarmedSessions.delete(conversationId);
+  } else {
+    if (prewarmed) {
+      console.log("[CALL] Pre-warmed not ready, will cold start");
+      if (prewarmed.openaiWS) { try { prewarmed.openaiWS.close(); } catch (e) {} }
+      prewarmedSessions.delete(conversationId);
+    } else {
+      console.log("[CALL] No pre-warmed session, cold start");
     }
   }
 
-  // ========================================
-  // Vonage WebSocket Event Handlers
-  // ========================================
+  const sendOpenAI = (obj) => {
+    if (openaiWS && openaiWS.readyState === WebSocket.OPEN) {
+      openaiWS.send(JSON.stringify(obj));
+    }
+  };
 
-  vonageWS.on("message", (raw) => {
+  const sendVonageAudio = (base64Audio24k) => {
+    if (vonageWS.readyState !== WebSocket.OPEN || !streamId) return;
+
     try {
-      // Vonage sends BOTH JSON control messages AND raw binary audio
-      const isBuffer = Buffer.isBuffer(raw);
-      
-      // Try to parse as JSON first
-      const rawString = raw.toString();
-      
-      // Debug: Log first message received
-      if (!firstAudioReceived && !vonageStreamReady) {
-        console.log(`🔍 First Vonage message type: ${typeof raw}, isBuffer: ${isBuffer}, length: ${raw.length}`);
-        console.log(`🔍 First 100 chars: ${rawString.substring(0, 100)}`);
+      const audio16k = resample24kTo16k(base64Audio24k);
+      vonageWS.send(JSON.stringify({
+        event: "media",
+        stream_id: streamId,
+        media: { payload: audio16k },
+      }));
+      audioPacketsSent++;
+      if (audioPacketsSent === 1) {
+        console.log("[CALL] First audio packet sent to caller");
       }
-      
-      // If it starts with {, it's a JSON control message
-      if (rawString[0] === '{') {
-        const msg = JSON.parse(rawString);
-        console.log(`📋 Vonage event: ${msg.event}`);
-        console.log(`📋 Full Vonage message:`, JSON.stringify(msg));
-        
-        if (msg.event === "websocket:connected") {
-          console.log("📞 Vonage websocket:connected, content-type:", msg['content-type']);
-          
-          vonageConnected = true;
-          
-          // Acquire session and attach
-          if (prewarmPool.has(conversationId)) {
-              const poolData = prewarmPool.get(conversationId);
-              prewarmPool.delete(conversationId);
-              currentSession = poolData.session;
-              console.log(`🎯 Using pre-warmed session for ${conversationId}`);
-              console.log(`✅ Session acquired and ready for ${conversationId}`);
-              
-              // Attach session (this queues buffered audio from greeting)
-              console.log("🎬 Attaching session and flushing buffered audio...");
-              currentSession.attachToVonage(sendVonageAudio, onFirstAudio);
-              console.log(`📦 Audio queued: ${audioQueue.length} packets`);
-              
-              // CRITICAL FIX: Vonage doesn't send media_start event
-              // According to official docs, after websocket:connected, audio flow begins immediately
-              // Start sending audio RIGHT NOW
-              console.log("🎵 Starting paced audio sender (50pps)...");
-              startAudioSender();
-              vonageMediaReady = true;
-            } else {
-              // SLOW PATH: Create new session (async)
-              console.log(`⚠️ No pre-warmed session - creating new session for ${conversationId}`);
-              (async () => {
-                try {
-                  const session = new PrewarmedSession(conversationId, businessId);
-                  await session.initialize();
-                  currentSession = session;
-                  console.log(`✅ New session ready for ${conversationId}`);
-                  
-                  // Attach once ready and start audio
-                  currentSession.attachToVonage(sendVonageAudio, onFirstAudio);
-                  console.log(`📦 Audio queued: ${audioQueue.length} packets`);
-                  console.log("🎵 Starting paced audio sender (50pps)...");
-                  startAudioSender();
-                  vonageMediaReady = true;
-                } catch (error) {
-                  console.error(`❌ Failed to create session: ${error.message}`);
-                }
-              })();
-            }
-        } else if (msg.event === "websocket:cleared") {
-          // Response to clear command - buffer was cleared
-          console.log("📋 Vonage buffer cleared");
-        } else if (msg.event === "websocket:notify") {
-          // Response to notify command - audio playback finished
-          console.log(`📋 Vonage notify event:`, JSON.stringify(msg));
+    } catch (e) {
+      console.error("[CALL] Audio send error:", e.message);
+    }
+  };
+
+  const flushAudioBuffer = () => {
+    if (audioBuffer.length > 0) {
+      console.log("[CALL] Flushing " + audioBuffer.length + " buffered audio chunks");
+      for (const chunk of audioBuffer) {
+        const audio24k = resample16kTo24k(chunk);
+        sendOpenAI({ type: "input_audio_buffer.append", audio: audio24k });
+      }
+      audioBuffer.length = 0;
+    }
+  };
+
+  const trySendGreeting = () => {
+    if (greetingSent || !vonageStreamReady || !openaiReady || !config) return;
+    console.log("[CALL] Sending greeting: \"" + config.greeting + "\"");
+    sendOpenAI({
+      type: "response.create",
+      response: {
+        modalities: ["audio"],
+        instructions: "Please say exactly: \"" + config.greeting + "\"",
+      },
+    });
+    greetingSent = true;
+  };
+
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    console.log("[CALL] Cleanup: biz=" + businessId + " sent=" + audioPacketsSent + " recv=" + audioPacketsReceived);
+    try { if (openaiWS) openaiWS.close(); } catch (e) {}
+    try { vonageWS.close(); } catch (e) {}
+  };
+
+  // Handle Vonage messages
+  vonageWS.on("message", (data) => {
+    try {
+      if (typeof data !== "string" && !Buffer.isBuffer(data)) return;
+      const str = data.toString();
+      if (!str.startsWith("{")) return;
+      const msg = JSON.parse(str);
+
+      if (msg.event === "connected" || msg.event === "websocket:connected") {
+        console.log("[CALL] Vonage connected");
+      }
+
+      if (msg.event === "start") {
+        streamId = msg.stream_id;
+        console.log("[CALL] Stream started: " + streamId);
+        vonageStreamReady = true;
+        trySendGreeting();
+      }
+
+      if (msg.event === "media" && msg.media && msg.media.payload) {
+        audioPacketsReceived++;
+        if (audioPacketsReceived === 1) {
+          console.log("[CALL] First audio from caller received");
+        }
+
+        if (openaiReady && openaiWS && openaiWS.readyState === WebSocket.OPEN) {
+          const audio24k = resample16kTo24k(msg.media.payload);
+          sendOpenAI({ type: "input_audio_buffer.append", audio: audio24k });
         } else {
-          // Log any other unknown events
-          console.log(`📋 Unknown Vonage event: ${msg.event}`);
-        }
-      } else {
-        // This is binary audio data (640 bytes of L16 PCM)
-        if (isBuffer && raw.length === 640) {
-          // First audio packet FROM user
-          if (!vonageStreamReady) {
-            vonageStreamReady = true;
-            console.log("✅ Vonage receiving audio from user (first packet)");
-          }
-          
-          // Forward audio to session
-          if (currentSession && currentSession.ready) {
-            const base64Audio = raw.toString('base64');
-            currentSession.sendAudioToOpenAI(base64Audio);
-          }
-        } else if (isBuffer && raw.length !== 640) {
-          console.log(`⚠️ Unexpected audio buffer size: ${raw.length} bytes (expected 640)`);
+          audioBuffer.push(msg.media.payload);
+          if (audioBuffer.length > 500) audioBuffer.shift();
         }
       }
-    } catch (error) {
-      // Only log actual errors, not parsing issues
-      if (!error.message?.includes('Unexpected token')) {
-        console.error("❌ Vonage message error:", error);
+
+      if (msg.event === "stop") {
+        console.log("[CALL] Stream stopped");
+        cleanup();
       }
+    } catch (e) {
+      console.error("[CALL] Vonage msg error:", e.message);
     }
   });
 
-  vonageWS.on("error", (error) => {
-    console.error("❌ Vonage WebSocket error:", error.message || error);
-    console.error("❌ Error stack:", error.stack);
-    console.log(`🔍 DEBUG: Error occurred, WebSocket state: ${vonageWS.readyState}`);
-    console.log(`🔍 DEBUG: Packets sent so far: ${audioPacketCount}, queue length: ${audioQueue.length}`);
-    console.log(`🔍 DEBUG: vonageConnected: ${vonageConnected}, vonageMediaReady: ${vonageMediaReady}`);
-    console.log(`🔍 DEBUG: Session attached: ${currentSession ? 'yes' : 'no'}, Session ready: ${currentSession?.ready || 'n/a'}`);
-  });
+  vonageWS.on("close", () => { console.log("[CALL] Vonage closed"); cleanup(); });
+  vonageWS.on("error", (e) => { console.error("[CALL] Vonage error:", e.message); cleanup(); });
 
-  vonageWS.on("close", async (code, reason) => {
-    const reasonStr = reason ? reason.toString() : 'none';
-    console.log(`📞 Vonage connection CLOSED`);
-    console.log(`🔍 Close Code: ${code}`);
-    console.log(`🔍 Close Reason: ${reasonStr}`);
-    console.log(`🔍 Packets sent: ${audioPacketCount}`);
-    console.log(`🔍 Packets queued: ${audioQueue.length}`);
-    console.log(`🔍 Call duration: ${Math.floor((Date.now() - callStartTime) / 1000)}s`);
-    console.log(`🔍 vonageConnected: ${vonageConnected}, vonageMediaReady: ${vonageMediaReady}`);
-    
-    // Decode close code for debugging
-    const closeCodeMeaning = {
-      1000: 'Normal closure',
-      1001: 'Going away',
-      1002: 'Protocol error',
-      1003: 'Unsupported data',
-      1006: 'Abnormal closure (no close frame)',
-      1007: 'Invalid frame payload',
-      1008: 'Policy violation',
-      1009: 'Message too big',
-      1010: 'Missing extension',
-      1011: 'Internal server error',
-      1015: 'TLS handshake failure'
-    };
-    console.log(`🔍 Close code meaning: ${closeCodeMeaning[code] || 'Unknown'}`);
-    
-    if (code === 1002) {
-      console.error('⚠️ PROTOCOL ERROR - Vonage rejected our WebSocket protocol!');
-      console.error('⚠️ Possible causes: invalid binary frame format, incorrect audio format, or missing handshake');
-    } else if (code === 1003) {
-      console.error('⚠️ UNSUPPORTED DATA - Vonage rejected our audio data format!');
-      console.error('⚠️ Check: audio must be 16kHz PCM16 mono, 640 bytes per frame');
-    }
-    
-    // Clean up audio sender
-    if (audioSender) {
-      clearInterval(audioSender);
-      audioSender = null;
-      console.log("🛑 Cleaned up audio sender");
-    }
-    
-    
-    // Close session
-    if (currentSession) {
-      currentSession.close();
-    }
-    
-    // End call log and trigger summary
-    const duration = Math.floor((Date.now() - callStartTime) / 1000);
-    if (trackingSecret) {
+  // Setup OpenAI handlers
+  const attachOpenAIHandlers = () => {
+    openaiWS.on("message", (raw) => {
       try {
-        await fetch(`${apiUrl}/api/phone/calls/end`, {
-          method: 'POST',
-          headers: callTrackingHeaders,
-          body: JSON.stringify({
-            conversationId,
-            duration
-          })
-        });
-        console.log(`✅ Call ended - duration: ${duration}s - summary will be generated`);
-      } catch (error) {
-        console.error('❌ Failed to end call log:', error.message);
+        const evt = JSON.parse(raw.toString());
+
+        if (evt.type === "response.audio.delta" && evt.delta) {
+          sendVonageAudio(evt.delta);
+        }
+
+        if (evt.type === "session.created") {
+          console.log("[CALL] OpenAI session created");
+        }
+
+        if (evt.type === "session.updated") {
+          console.log("[CALL] OpenAI session configured");
+        }
+
+        if (evt.type === "input_audio_buffer.speech_started") {
+          console.log("[CALL] Caller speaking detected");
+        }
+
+        if (evt.type === "input_audio_buffer.speech_stopped") {
+          console.log("[CALL] Caller stopped speaking");
+        }
+
+        if (evt.type === "response.audio_transcript.done" && evt.transcript) {
+          console.log("[CALL] AI said: " + evt.transcript.substring(0, 100));
+        }
+
+        if (evt.type === "conversation.item.input_audio_transcription.completed" && evt.transcript) {
+          console.log("[CALL] Caller said: " + evt.transcript.substring(0, 100));
+        }
+
+        if (evt.type === "error") {
+          console.error("[CALL] OpenAI error:", JSON.stringify(evt.error));
+        }
+      } catch (e) {
+        console.error("[CALL] OpenAI msg parse error:", e.message);
       }
-    } else {
-      console.warn('⚠️ Skipping call summary - no tracking secret configured');
+    });
+
+    openaiWS.on("error", (e) => { console.error("[CALL] OpenAI error:", e.message); });
+    openaiWS.on("close", () => { console.log("[CALL] OpenAI closed"); cleanup(); });
+  };
+
+  if (openaiReady) {
+    attachOpenAIHandlers();
+    flushAudioBuffer();
+    trySendGreeting();
+  } else {
+    try {
+      config = await fetchVoiceConfig(businessId);
+      console.log("[CALL] Config loaded: voice=" + config.voice);
+
+      openaiWS = await connectOpenAI();
+      console.log("[CALL] OpenAI connected");
+
+      configureOpenAISession(openaiWS, config);
+
+      openaiReady = true;
+      attachOpenAIHandlers();
+      flushAudioBuffer();
+      trySendGreeting();
+    } catch (err) {
+      console.error("[CALL] Setup failed:", err.message);
+      cleanup();
     }
-  });
+  }
 });
 
-function getBusinessInstructions(bizId) {
-  const profiles = {
-    wethreeloggerheads: `You are Joggle for We Three Loggerheads pub. Your PRIMARY GOAL: Understand exactly what the customer needs and help them.
-
-APPROACH:
-1. Listen carefully and let customers explain what they want
-2. Ask clarifying questions to fully understand their needs
-3. Confirm you've understood correctly before providing information
-4. Be thorough - make sure they get everything they need
-
-TONE: Warm, friendly, patient, and genuinely helpful. Make customers feel heard.
-
-YOU CAN HELP WITH: Opening hours, food menu, drinks, events, bookings, general pub information, directions, accessibility, dietary requirements.
-
-FOR TABLE BOOKINGS:
-- First confirm their preferred date, time, and party size
-- Check if they have any special requirements (high chairs, accessibility, dietary needs)
-- Then collect: name, phone number
-- Confirm all details back to them
-- Let them know what to expect next
-
-IMPORTANT: If you're not sure what they need, ask! Don't assume. Always check you've understood before moving on. Your job is to make sure they leave the call satisfied and with everything they needed.`,
-
-    abbeygaragedoors: `You are Joggle for Abbey Garage Doors NW. Your PRIMARY GOAL: Understand the customer's garage door issue or need, and help them get the right solution.
-
-APPROACH:
-1. Listen to their situation - what's the problem or what do they need?
-2. Ask questions to understand the full picture (type of door, urgency, what's wrong)
-3. Check you've understood their situation correctly
-4. Provide clear, practical help and next steps
-
-TONE: Helpful, reassuring, practical, local UK. Make customers feel their problem is understood and being handled.
-
-YOU CAN HELP WITH: Opening hours, service areas (North West England), new garage door quotes, repairs, emergency callouts, booking engineer visits, general advice.
-
-FOR ISSUES/REPAIRS:
-- First understand: What's happening? Is it urgent/safety issue? What type of door?
-- Confirm you understand the situation
-- Explain what can be done and timeframes
-- If urgent/safety issue, reassure them and get contact details to prioritize
-
-FOR NEW DOORS/QUOTES:
-- Understand what they're looking for and why
-- Ask about their requirements (size, style, automation)
-- Explain the process for getting a quote
-- Collect contact details and preferred callback time
-
-IMPORTANT: Take time to understand before jumping to solutions. Garage doors can be complex - make sure you know what they actually need. If something's unclear, ask! Better to check than assume.`,
-
-    default: `You are Joggle, this business's phone assistant. Your PRIMARY GOAL: Understand what the customer needs and genuinely help them.
-
-APPROACH:
-1. Listen carefully to what they want
-2. Ask questions if anything is unclear
-3. Confirm you understand their needs
-4. Provide helpful, accurate information or assistance
-5. Make sure they're satisfied before ending
-
-TONE: Friendly, patient, professional. Make customers feel listened to and helped.
-
-IMPORTANT PRINCIPLES:
-- Don't rush - take time to understand what they really need
-- Ask clarifying questions rather than guessing
-- Confirm understanding: "Just to make sure I've got this right..."
-- Be thorough - anticipate what else might help them
-- If you can't help with something, be honest and offer alternatives
-- Always check if there's anything else before finishing
-
-Remember: A helpful conversation is better than a quick one. Your job is to make customers feel truly helped.`
-  };
-  return profiles[bizId] || profiles.default;
-}
-
-console.log(`🚀 Service started successfully on port ${PORT}`);
+server.listen(PORT, () => {
+  console.log("Joggle Phone Relay v2.0 listening on port " + PORT);
+  console.log("JOGGLE_API: " + JOGGLE_API);
+  console.log("Model: " + OPENAI_MODEL);
+  console.log("Audio: Vonage 16kHz <-> OpenAI 24kHz resampling enabled");
+});
