@@ -101,10 +101,6 @@ const server = createServer((req, res) => {
           openaiWS: null,
           ready: false,
           createdAt: Date.now(),
-          // Greeting pre-generation
-          greetingAudioBuffer: [],
-          greetingBufferReady: false,
-          greetingResponseId: null,
         };
         prewarmedSessions.set(conversationId, session);
 
@@ -181,7 +177,7 @@ function connectOpenAI() {
   return new Promise((resolve, reject) => {
     const url = "wss://api.openai.com/v1/realtime?model=" + encodeURIComponent(OPENAI_MODEL);
     const ws = new WebSocket(url, {
-      headers: { Authorization: "Bearer " + OPENAI_API_KEY, "OpenAI-Beta": "realtime=v1" },
+      headers: { Authorization: "Bearer " + OPENAI_API_KEY },
     });
     const timeout = setTimeout(() => {
       ws.terminate();
@@ -223,69 +219,6 @@ function enableVAD(openaiWS) {
   }));
 }
 
-// ── Greeting Pre-generation ──
-// Called after configureOpenAISession during prewarm.
-// Sends response.create immediately (OpenAI queues it after session.update).
-// By the time Vonage connects (~1-3s later), audio is ready to flush immediately.
-function prewarmGreeting(session) {
-  const openaiWS = session.openaiWS;
-
-  // Send response.create immediately — OpenAI processes session.update first (queue order)
-  // Do NOT wait for session.updated event which may have already fired or arrive late
-  console.log("[PREWARM] Triggering greeting pre-generation immediately");
-  openaiWS.send(JSON.stringify({
-    type: "response.create",
-    response: {
-      modalities: ["audio", "text"],
-      instructions: "Please say exactly: \"" + session.config.greeting + "\"",
-    },
-  }));
-
-  const onMessage = (raw) => {
-    try {
-      const evt = JSON.parse(raw.toString());
-
-      // Track the greeting response ID
-      if (evt.type === "response.created" && !session.greetingResponseId) {
-        session.greetingResponseId = evt.response && evt.response.id;
-        console.log("[PREWARM] Greeting response ID: " + session.greetingResponseId);
-      }
-
-      // Buffer audio deltas — these are 24kHz base64 PCM16, same format sendVonageAudio expects
-      if (evt.type === "response.audio.delta" && evt.delta) {
-        session.greetingAudioBuffer.push(evt.delta);
-        if (session.greetingAudioBuffer.length === 1) {
-          console.log("[PREWARM] First greeting audio chunk buffered");
-        }
-        // If Vonage already connected while we were generating, pipe directly
-        if (session.onGreetingChunk) {
-          session.onGreetingChunk(evt.delta);
-        }
-      }
-
-      // Greeting generation complete
-      if (evt.type === "response.done") {
-        const responseId = evt.response && evt.response.id;
-        if (responseId === session.greetingResponseId) {
-          session.greetingBufferReady = true;
-          console.log("[PREWARM] Greeting ready — " + session.greetingAudioBuffer.length + " chunks pre-buffered");
-          openaiWS.removeListener("message", onMessage);
-          if (session.onGreetingDone) {
-            session.onGreetingDone();
-          }
-        }
-      }
-
-      if (evt.type === "error") {
-        console.error("[PREWARM] OpenAI error during greeting pre-gen:", JSON.stringify(evt.error));
-        openaiWS.removeListener("message", onMessage);
-      }
-    } catch (e) {}
-  };
-
-  openaiWS.on("message", onMessage);
-}
-
 async function prewarmSession(session) {
   const t0 = Date.now();
 
@@ -297,10 +230,33 @@ async function prewarmSession(session) {
 
   session.config = config;
   session.openaiWS = openaiWS;
-  configureOpenAISession(session.openaiWS, session.config);
 
-  // Start greeting pre-generation in background — audio will be buffered by the time call arrives
-  prewarmGreeting(session);
+  // Wait for session.updated before marking ready — this confirms the session
+  // is fully configured and VAD is off, so the greeting won't be cancelled
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      console.warn("[PREWARM] session.updated not received within 5s — marking ready anyway");
+      resolve();
+    }, 5000);
+
+    const onMsg = (raw) => {
+      try {
+        const evt = JSON.parse(raw.toString());
+        if (evt.type === "session.updated") {
+          clearTimeout(timeout);
+          openaiWS.off("message", onMsg);
+          console.log("[PREWARM] session.updated confirmed in " + (Date.now() - t0) + "ms");
+          resolve();
+        } else if (evt.type === "error") {
+          clearTimeout(timeout);
+          openaiWS.off("message", onMsg);
+          reject(new Error("OpenAI error during prewarm: " + JSON.stringify(evt.error)));
+        }
+      } catch (e) {}
+    };
+    openaiWS.on("message", onMsg);
+    configureOpenAISession(openaiWS, config);
+  });
 
   session.ready = true;
   console.log("[PREWARM] Ready in " + (Date.now() - t0) + "ms for " + session.conversationId);
@@ -332,7 +288,6 @@ wss.on("connection", async (vonageWS, request) => {
   const callerAudioDuringGreeting = [];
   let greetingTimeoutId = null;
   let silenceIntervalId = null;
-  let currentResponseId = null;
 
   // 20ms of silence at 16kHz PCM16 = 640 bytes of zeros (standard Vonage frame)
   const SILENCE_FRAME = Buffer.alloc(640, 0);
@@ -362,15 +317,13 @@ wss.on("connection", async (vonageWS, request) => {
     }
   };
 
-  // Check for pre-warmed session — save reference so websocket:connected can use it
-  let acquiredPrewarm = null;
+  // Check for pre-warmed session
   const prewarmed = prewarmedSessions.get(conversationId);
   if (prewarmed && prewarmed.ready && prewarmed.openaiWS && prewarmed.openaiWS.readyState === WebSocket.OPEN) {
     console.log("[CALL] Using pre-warmed session");
     openaiWS = prewarmed.openaiWS;
     config = prewarmed.config;
     openaiReady = true;
-    acquiredPrewarm = prewarmed;
     prewarmedSessions.delete(conversationId);
   } else if (prewarmed) {
     console.log("[CALL] Pre-warm in progress - will wait after handlers registered");
@@ -396,18 +349,15 @@ wss.on("connection", async (vonageWS, request) => {
     }
 
     try {
-      stopSilenceKeepAlive(); // Stop silence whenever real audio arrives (greeting or response)
+      if (audioPacketsSent === 0) {
+        stopSilenceKeepAlive();
+      }
       const audio16kBase64 = resample24kTo16k(base64Audio24k);
       const audio16kBuf = Buffer.from(audio16kBase64, "base64");
-      // Send in 640-byte (20ms at 16kHz) chunks — the frame size Vonage expects
-      const FRAME_SIZE = 640;
-      for (let offset = 0; offset < audio16kBuf.length; offset += FRAME_SIZE) {
-        const frame = audio16kBuf.subarray(offset, offset + FRAME_SIZE);
-        vonageWS.send(frame);
-        audioPacketsSent++;
-        if (audioPacketsSent === 1) {
-          console.log("[CALL] First audio packet sent to caller (" + frame.length + " bytes)");
-        }
+      vonageWS.send(audio16kBuf);
+      audioPacketsSent++;
+      if (audioPacketsSent === 1) {
+        console.log("[CALL] First audio packet sent to caller");
       }
     } catch (e) {
       console.error("[CALL] Audio send error:", e.message);
@@ -493,86 +443,8 @@ wss.on("connection", async (vonageWS, request) => {
           if (msg.event === "websocket:connected") {
             console.log("[CALL] Vonage websocket:connected (content-type: " + (msg["content-type"] || "unknown") + ")");
             vonageStreamReady = true;
-
-            // If session wasn't ready at connection time, try to acquire it now
-            if (!openaiReady) {
-              const pw = prewarmedSessions.get(conversationId);
-              if (pw && pw.ready && pw.openaiWS && pw.openaiWS.readyState === WebSocket.OPEN) {
-                openaiWS = pw.openaiWS;
-                config = pw.config;
-                openaiReady = true;
-                acquiredPrewarm = pw;
-                prewarmedSessions.delete(conversationId);
-                attachOpenAIHandlers();
-                flushAudioBuffer();
-              }
-            }
-
-            // ── Happy path: pre-generated greeting audio is ready ──
-            // acquiredPrewarm holds the session object (saved when session was first acquired)
-            if (acquiredPrewarm && acquiredPrewarm.greetingAudioBuffer.length > 0) {
-              const chunks = acquiredPrewarm.greetingAudioBuffer.length;
-              console.log("[CALL] Flushing " + chunks + " pre-generated greeting chunks (ready=" + acquiredPrewarm.greetingBufferReady + ")");
-              greetingSent = true;
-              greetingAudioReceived = true;
-              greetingResponseId = acquiredPrewarm.greetingResponseId;
-              // Send 10 silence frames (200ms) first to prime Vonage's audio pipeline
-              // Without this, the first audio frames are dropped before Vonage is ready
-              for (let i = 0; i < 10; i++) {
-                try { vonageWS.send(SILENCE_FRAME); } catch (e) {}
-              }
-              for (const delta of acquiredPrewarm.greetingAudioBuffer) {
-                sendVonageAudio(delta);
-              }
-              acquiredPrewarm.greetingAudioBuffer = [];
-              console.log("[CALL] Pre-generated greeting flushed — " + audioPacketsSent + " packets sent");
-
-              // If greeting generation was already complete during pre-warm, response.done
-              // will never fire on the call handler — mark done and enable VAD now
-              if (acquiredPrewarm.greetingBufferReady) {
-                greetingDone = true;
-                console.log("[CALL] Greeting complete (pre-generated) — enabling VAD");
-                enableVAD(openaiWS);
-                flushCallerAudioBuffer();
-                startSilenceKeepAlive(); // Hold line open while waiting for caller to speak
-              }
-              // If greeting was still streaming when call arrived, response.done will fire
-              // normally through attachOpenAIHandlers and complete the flow
-            } else if (acquiredPrewarm) {
-              // Prewarm session is ready but greeting still generating — pipe chunks directly as they arrive
-              console.log("[CALL] Greeting in-flight — piping to caller as generated");
-              greetingSent = true;
-              greetingAudioReceived = true;
-              if (acquiredPrewarm.greetingResponseId) {
-                greetingResponseId = acquiredPrewarm.greetingResponseId;
-              }
-              // Prime Vonage's audio pipeline with silence before first audio chunk
-              for (let i = 0; i < 10; i++) {
-                try { vonageWS.send(SILENCE_FRAME); } catch (e) {}
-              }
-              acquiredPrewarm.onGreetingChunk = (delta) => {
-                sendVonageAudio(delta);
-              };
-              acquiredPrewarm.onGreetingDone = () => {
-                greetingDone = true;
-                console.log("[CALL] Greeting complete (piped) — enabling VAD");
-                if (greetingTimeoutId) { clearTimeout(greetingTimeoutId); greetingTimeoutId = null; }
-                enableVAD(openaiWS);
-                flushCallerAudioBuffer();
-                startSilenceKeepAlive(); // Hold line open while waiting for caller to speak
-              };
-              // If greeting somehow already marked done but buffer was cleared, handle it
-              if (acquiredPrewarm.greetingBufferReady) {
-                greetingDone = true;
-                enableVAD(openaiWS);
-              } else {
-                startSilenceKeepAlive(); // Safety net — first audio chunk will call stopSilenceKeepAlive()
-              }
-            } else {
-              // ⚡ No prewarm at all — cold start greeting
-              startSilenceKeepAlive();
-              trySendGreeting();
-            }
+            startSilenceKeepAlive();
+            trySendGreeting();
           } else if (msg.event === "websocket:cleared" || msg.event === "websocket:notify") {
             // Acknowledgement events — no action needed
           } else {
@@ -636,29 +508,17 @@ wss.on("connection", async (vonageWS, request) => {
             if (greetingTimeoutId) { clearTimeout(greetingTimeoutId); greetingTimeoutId = null; }
             console.log("[CALL] First greeting audio delta received from OpenAI");
           }
-          // Only send audio for the current active response — drop stale chunks after barge-in
-          if (!currentResponseId || evt.response_id === currentResponseId) {
-            sendVonageAudio(evt.delta);
-          }
+          sendVonageAudio(evt.delta);
         }
 
-        if (evt.type === "response.created") {
-          const newResponseId = evt.response && evt.response.id;
-          if (!greetingResponseId && greetingSent) {
-            greetingResponseId = newResponseId;
-            console.log("[CALL] Greeting response ID: " + greetingResponseId);
-          }
-          currentResponseId = newResponseId;
-          console.log("[CALL] New response started: " + newResponseId);
+        if (evt.type === "response.created" && !greetingResponseId && greetingSent) {
+          greetingResponseId = evt.response && evt.response.id;
+          console.log("[CALL] Greeting response ID: " + greetingResponseId);
         }
 
         if (evt.type === "response.done") {
           const responseId = evt.response && evt.response.id;
           const responseStatus = evt.response && evt.response.status;
-          // Clear current response when it ends (cancelled, failed, or completed)
-          if (responseId === currentResponseId) {
-            currentResponseId = null;
-          }
           if (!greetingDone && (responseId === greetingResponseId || greetingResponseId === null)) {
             if (responseStatus === "cancelled" || responseStatus === "failed") {
               console.log("[CALL] Greeting response " + responseStatus + " — retrying greeting");
@@ -672,11 +532,7 @@ wss.on("connection", async (vonageWS, request) => {
               console.log("[CALL] Greeting complete — enabling VAD and flushing caller audio");
               enableVAD(openaiWS);
               flushCallerAudioBuffer();
-              startSilenceKeepAlive(); // Hold line open while waiting for caller to speak
             }
-          } else if (responseStatus !== "cancelled") {
-            // After a conversation response completes, hold the line open while caller thinks
-            startSilenceKeepAlive();
           }
         }
 
@@ -685,18 +541,15 @@ wss.on("connection", async (vonageWS, request) => {
         }
 
         if (evt.type === "session.updated") {
-          console.log("[CALL] OpenAI session configured");
+          console.log("[CALL] OpenAI session configured — ready to greet");
+          if (!openaiReady) {
+            openaiReady = true;
+            trySendGreeting();
+          }
         }
 
         if (evt.type === "input_audio_buffer.speech_started") {
-          console.log("[CALL] Caller speaking detected — clearing Vonage audio buffer (barge-in)");
-          // Drop any in-flight audio chunks for the current response
-          currentResponseId = null;
-          // Tell Vonage to immediately discard buffered audio so the caller isn't spoken over
-          if (vonageWS.readyState === WebSocket.OPEN) {
-            try { vonageWS.send(JSON.stringify({ action: "clear" })); } catch (e) {}
-          }
-          stopSilenceKeepAlive();
+          console.log("[CALL] Caller speaking detected");
         }
 
         if (evt.type === "input_audio_buffer.speech_stopped") {
@@ -731,14 +584,9 @@ wss.on("connection", async (vonageWS, request) => {
   };
 
   if (openaiReady) {
+    // Pre-warmed session already has session.updated confirmed — attach handlers and greet
     attachOpenAIHandlers();
-    flushAudioBuffer();
-    // If we have a pre-warmed session, DO NOT call trySendGreeting() —
-    // the greeting is handled via the buffer flush in websocket:connected.
-    // Calling it here would send a duplicate response.create on the same connection.
-    if (!acquiredPrewarm) {
-      trySendGreeting();
-    }
+    trySendGreeting();
   } else {
     // Check if there's an in-progress prewarm to wait for
     const inProgressPrewarm = prewarmedSessions.get(conversationId);
@@ -754,9 +602,9 @@ wss.on("connection", async (vonageWS, request) => {
         console.log("[CALL] Prewarm completed in " + (Date.now() - waitStart) + "ms - using pre-warmed session");
         openaiWS = inProgressPrewarm.openaiWS;
         config = inProgressPrewarm.config;
+        // session.updated already received during prewarm — safe to mark ready and greet
         openaiReady = true;
         attachOpenAIHandlers();
-        flushAudioBuffer();
         trySendGreeting();
         return;
       } else {
@@ -774,12 +622,10 @@ wss.on("connection", async (vonageWS, request) => {
       openaiWS = coldWS;
       console.log("[CALL] Config+OpenAI ready (cold start): voice=" + config.voice);
 
-      configureOpenAISession(openaiWS, config);
-
-      openaiReady = true;
+      // Attach handlers BEFORE sending session.update so session.updated triggers trySendGreeting
       attachOpenAIHandlers();
-      flushAudioBuffer();
-      trySendGreeting();
+      configureOpenAISession(openaiWS, config);
+      // openaiReady will be set to true inside session.updated handler once confirmed
     } catch (err) {
       console.error("[CALL] Setup failed:", err.message);
       cleanup();
@@ -788,9 +634,8 @@ wss.on("connection", async (vonageWS, request) => {
 });
 
 server.listen(PORT, () => {
-  console.log("Joggle Phone Relay v2.1 listening on port " + PORT);
+  console.log("Joggle Phone Relay v2.0 listening on port " + PORT);
   console.log("JOGGLE_API: " + JOGGLE_API);
   console.log("Model: " + OPENAI_MODEL);
   console.log("Audio: Vonage 16kHz <-> OpenAI 24kHz resampling enabled");
-  console.log("Greeting pre-generation: ENABLED");
 });
